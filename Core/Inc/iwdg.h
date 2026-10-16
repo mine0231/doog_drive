@@ -42,6 +42,10 @@ void MX_IWDG_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 
+/* 运行时修改 IWDG 超时（重装值）；返回 0=成功 1=失败。
+ * 用于：启动序列（约 1.95s）期放宽超时，进入主循环前收紧回默认值。 */
+uint8_t IWDG_SetReload(uint16_t reload);
+
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

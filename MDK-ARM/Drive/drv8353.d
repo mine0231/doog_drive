@@ -32,4 +32,4 @@ drive/drv8353.o: ..\Core\Src\DRV8353.C ..\Core\Inc\main.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_uart.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_uart_ex.h \
   ..\Core\Inc\spi.h ..\Core\Inc\DRV8353.H ..\Core\Inc\tim.h \
-  ..\Core\Inc\dwt_delay.h
+  ..\Core\Inc\dwt_delay.h ..\Core\Inc\iwdg.h

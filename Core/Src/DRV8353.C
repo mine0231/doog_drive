@@ -3,6 +3,11 @@
 #include "DRV8353.H"
 #include "tim.h"
 #include "dwt_delay.h"   // DWT_DelayMs
+#include "iwdg.h"        // HAL_IWDG_Refresh / hiwdg
+
+/* 单次寄存器访问最坏耗时 = SPI 超时 100ms；在最小访问单元内补喂狗，
+ * 可一次性覆盖启动序列（ConfigRegs/Recover/SelfCheck）与主循环/中断的全部调用点。 */
+#define BOOT_WDG_FEED()  HAL_IWDG_Refresh(&hiwdg)
 
 
 /**
@@ -30,6 +35,7 @@ void DRV8353_WriteReg(uint8_t reg, uint16_t data)
 		DWT_DelayMs(1);
     HAL_SPI_TransmitReceive(&hspi2, (uint8_t *)&tx, (uint8_t *)&rx, 1, 100);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_SET);
+    BOOT_WDG_FEED();   // SPI 超时(100ms)路径下兜底喂狗
 }
 
 
@@ -45,6 +51,7 @@ uint16_t DRV8353_ReadReg(uint8_t reg)
     HAL_SPI_TransmitReceive(&hspi2, (uint8_t *)&tx, (uint8_t *)&rx, 1, 100);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_SET);
 
+    BOOT_WDG_FEED();   // SPI 超时(100ms)路径下兜底喂狗
     return rx;   // HAL 16 位模式已写入完整 16 位
 }
 

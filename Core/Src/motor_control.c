@@ -20,6 +20,12 @@
 #define BOOT_SC_RETRY_DELAY_MS 20     // 自检重试之间的短延时(ms)，让驱动/SPI 稳定
 #define BOOT_DEV_ERR_BLINK_MS  200    // 硬件错误(锁死)时 LED 闪烁半周期(ms)
 
+/* 看门狗超时分档：启动序列（含自动对齐 800ms×2）实测约 1.95s，超过 CubeMX 默认 1s —— 零余量，
+ * 任一段耗时抖动都会触发 IWDG 复位（复位后又重跑启动序列，表现为"反复自动对齐"）。
+ * 故启动期放宽到 ≈4s，进入主循环前收紧回 ≈1s：既不牺牲运行时保护，又给启动留 2 倍余量。 */
+#define IWDG_RELOAD_BOOT   500u   /* ≈4.0s：500 × 256 / LSI(≈32kHz) */
+#define IWDG_RELOAD_RUN    125u   /* ≈1.0s：与 CubeMX 默认一致 */
+
 extern float manual_voltage;   // 手动给定电压 (V)（定义于 main.c）
 extern float manual_speed;     // 手动给定速度 (rad/s)（定义于 main.c）
 
@@ -34,6 +40,12 @@ extern volatile float KTH7823_Speed_Rads;
 //电机控制初始化
 void MotorControl_Init(void)
 {
+    /* 启动期放宽看门狗超时：本函数 + 启动自检 + 自动对齐合计约 1.95s > 默认 1s。
+     * 收紧动作在 MotorControl_BootSequence() 收尾处（含硬件错误提前返回的路径）。
+     * 放宽失败必须上报：否则静默退回 1s，启动序列仍会复位（正是要修的问题）。 */
+    if (IWDG_SetReload(IWDG_RELOAD_BOOT) != 0u) {
+        UART_SendString("[BOOT] WARN: IWDG boot timeout widen failed (still ~1s, boot may reset)\r\n");
+    }
     // 计算实际控制周期
     // TIM1 为中心对齐模式，计数时钟 = tim_clk：
     // PWM 频率     f_pwm = tim_clk / (2*(ARR+1))
@@ -184,6 +196,15 @@ static int Boot_RunAlign(void)
     return ok;
 }
 
+/* 启动序列收尾：把看门狗超时从"启动值(≈4s)"收紧回"运行值(≈1s)"。
+ * 失败时保持启动值（仍有保护，仅余量更大）并明确上报，避免静默降级。 */
+static void Boot_RestoreIwdgTimeout(void)
+{
+    if (IWDG_SetReload(IWDG_RELOAD_RUN) != 0u) {
+        UART_SendString("[BOOT] WARN: IWDG timeout restore failed (kept boot value)\r\n");
+    }
+}
+
 // 控制命令门控（uart_cmd.c / fdcan_app.c 调用）：1=放行 0=拒绝
 uint8_t MotorControl_CommandGate(void)
 {
@@ -255,6 +276,7 @@ void MotorControl_BootSequence(void)
 
         UART_SendString("[BOOT] ERROR: HARDWARE ERROR - driver self-check failed 3 times. "
                         "Align skipped, entered IDLE. Maintenance required.\r\n");
+        Boot_RestoreIwdgTimeout();   // 提前返回路径也必须收紧超时，不能只靠正常收尾
         UART_SendString("===== BOOT SEQUENCE END =====\r\n\r\n");
         return;
     }
@@ -266,8 +288,9 @@ void MotorControl_BootSequence(void)
         UART_SendString("[BOOT] WARN: self-check PASS but align not successful. "
                         "Entered IDLE, waiting for control.\r\n");
     }
+    Boot_RestoreIwdgTimeout();   // 启动序列结束：收紧回运行超时(≈1s)
     UART_SendString("===== BOOT SEQUENCE END =====\r\n\r\n");
-		
+
     UART_SendString("Please send “help” for more information.\r\n\r\n");		
 }
 

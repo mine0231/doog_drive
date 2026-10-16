@@ -100,6 +100,97 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
 /* 上电自动执行启动序列已迁移至 motor_control.c（MotorControl_BootSequence） */
 
+/* ==================== 启动/异常取证实现（BOOT_FORENSIC_ENABLE=1 时启用） ====================
+ * 设计约束：
+ *   1) fault 上下文可用：不依赖中断/DMA/环形缓冲，全部走 USART3 寄存器轮询直发；
+ *   2) 不占主栈：所有缓冲均为静态区（主栈仅 1KB）；
+ *   3) 安全优先：先纯寄存器关断三路 PWM 与驱动 EN，再打印现场。 */
+#if (BOOT_FORENSIC_ENABLE)
+static void BootForensic_PutChar(char c)
+{
+    uint32_t guard = 200000u;   /* 兜底：USART 未初始化或异常时不死锁 */
+    while (((USART3->ISR & USART_ISR_TXE_TXFNF) == 0u) && (guard != 0u)) {
+        guard--;
+    }
+    USART3->TDR = (uint16_t)(uint8_t)c;
+}
+
+static void BootForensic_Puts(const char *s)
+{
+    while (*s != '\0') {
+        BootForensic_PutChar(*s);
+        s++;
+    }
+}
+
+static void BootForensic_PutHex32(uint32_t v)
+{
+    int i;
+    for (i = 28; i >= 0; i -= 4) {
+        uint32_t n = (v >> (uint32_t)i) & 0x0Fu;
+        BootForensic_PutChar((char)((n < 10u) ? ('0' + (char)n) : ('A' + (char)(n - 10u))));
+    }
+}
+
+/* 启动序列打点：定位各阶段真实耗时（正常路径到主循环应 ≈1900ms 量级） */
+void BootForensic_Mark(const char *tag)
+{
+    static char line[96];   /* 静态区：主栈仅 1KB，禁止大数组入栈 */
+    sprintf(line, "[MARK] t=%lums %s\r\n", (unsigned long)HAL_GetTick(), tag);
+    UART_SendString(line);
+}
+
+/* 复位原因逐位明细：一律以 CSR 原始位为准（HAL 的 RCC_FLAG_* 命名在本系列有歧义，
+ * 例如 uart_cmd.c 横幅里的 BOR 实际会取到 POR 位） */
+void BootForensic_PrintResetCause(void)
+{
+    static char line[192];
+    uint32_t csr = RCC->CSR;
+    sprintf(line,
+            "[RST ] CSR=0x%08lX POR=%lu PIN=%lu BOR=%lu SFT=%lu IWDG=%lu WWDG=%lu LPWR=%lu OBL=%lu\r\n",
+            (unsigned long)csr,
+            (unsigned long)((csr >> 27) & 1u),   /* bit27 PORRSTF  上电/掉电复位 */
+            (unsigned long)((csr >> 26) & 1u),   /* bit26 PINRSTF  NRST 复位（冷启动与 POR 同时置位属正常） */
+            (unsigned long)((csr >> 25) & 1u),   /* bit25 BORRSTF  BOR 复位 */
+            (unsigned long)((csr >> 28) & 1u),   /* bit28 SFTRSTF  软件复位 */
+            (unsigned long)((csr >> 29) & 1u),   /* bit29 IWDGRSTF 独立看门狗复位 */
+            (unsigned long)((csr >> 30) & 1u),   /* bit30 WWDGRSTF 窗口看门狗复位 */
+            (unsigned long)((csr >> 31) & 1u),   /* bit31 LPWRRSTF 低功耗复位 */
+            (unsigned long)((csr >> 24) & 1u));  /* bit24 OBLRSTF  Option Byte 装载复位 */
+    UART_SendString(line);
+}
+
+/* 异常现场保留：先安全关断，再直发现场，最后喂狗停留（不再静默等 IWDG 复位丢现场） */
+void BootForensic_Fatal(const char *tag, uint32_t a, uint32_t b, uint32_t c)
+{
+    /* 1) 安全第一：纯寄存器关断三路输出与驱动使能（不依赖 HAL/中断/栈） */
+    TIM1->CCR1 = 0u;
+    TIM1->CCR2 = 0u;
+    TIM1->CCR3 = 0u;
+    TIM1->BDTR &= ~((uint32_t)TIM_BDTR_MOE);    /* 硬件立即关断三路 PWM 输出 */
+    GPIOA->BRR = (uint32_t)ENABLE_Pin;          /* PA11=0：DRV8353 EN 拉低 */
+
+    /* 2) 摘掉 USART3 的 DMA 请求，避免与在途 DMA 抢占 TDR，再直发现场信息 */
+    USART3->CR3 &= ~((uint32_t)(USART_CR3_DMAT | USART_CR3_DMAR));
+    BootForensic_Puts("\r\n[FATAL] ");
+    BootForensic_Puts(tag);
+    BootForensic_Puts(" a=0x"); BootForensic_PutHex32(a);
+    BootForensic_Puts(" b=0x"); BootForensic_PutHex32(b);
+    BootForensic_Puts(" c=0x"); BootForensic_PutHex32(c);
+    BootForensic_Puts(" CFSR=0x"); BootForensic_PutHex32(SCB->CFSR);
+    BootForensic_Puts(" HFSR=0x"); BootForensic_PutHex32(SCB->HFSR);
+    BootForensic_Puts(" MMFAR=0x"); BootForensic_PutHex32(SCB->MMFAR);
+    BootForensic_Puts(" BFAR=0x"); BootForensic_PutHex32(SCB->BFAR);
+    BootForensic_Puts("\r\n");
+
+    /* 3) 保留现场：持续喂狗并停留（IWDG 不再复位，可接调试器查看现场变量）。
+     *    直接写 IWDG->KR，绕开 HAL 互斥锁，避免"锁未释放导致喂狗失败"。 */
+    while (1) {
+        IWDG->KR = 0x0000AAAAu;
+    }
+}
+#endif /* BOOT_FORENSIC_ENABLE */
+
 /* USER CODE END 0 */
 
 /**
