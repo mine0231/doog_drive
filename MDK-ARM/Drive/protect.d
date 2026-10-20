@@ -35,4 +35,5 @@ drive/protect.o: ..\Core\Src\Protect.c ..\Core\Inc\Protect.h \
   ..\Core\Inc\sense.h ..\Core\Inc\tim.h ..\Core\Inc\main.h \
   ..\Core\Inc\foc.h ..\Core\Inc\pid.h \
   ..\Middlewares\ST\ARM\DSP\Inc\arm_math.h \
-  ..\Drivers\CMSIS\Include\cmsis_compiler.h
+  ..\Drivers\CMSIS\Include\cmsis_compiler.h ..\Core\Inc\motor_control.h \
+  ..\Core\Inc\spi.h

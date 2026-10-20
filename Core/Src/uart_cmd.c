@@ -366,67 +366,12 @@ static int UART_Test_AngleCmd(const char* cmd_buf, char* response)
 }
 /* ==================== END TEST: 开环角度运动 ==================== */
 
-/* ==================== BEGIN [TEST] 故障/状态自动串口上报（验证完整体删除）====================
- * 目的：把"灯为什么闪"的第一手原因自动打到串口，不依赖 KEIL Watch。
- * 输出：
- *   [EVT]  事件驱动：模式/故障码/重试次数/EN/nFAULT/armed 任一变化立即打印（带 t= 时间戳）
- *   [FLT]  故障记录：每次保护触发由 ISR 钩子 UartLog_FaultRecord() 入队，主循环逐条打印
- *   [LED1ST] 闪灯起点：进入 FAULT 后 LED 第一次跳变的时刻（只打一次）
- *   [RBLK] 恢复被挡：fault_recover_blocked() 返回 1 时记录被挡的判据与当前值
- *   [SNAP] 周期快照：每 1s 两行，含 CAN 计数/错误计数/母线电压/电流/温度/编码器有效性
- * 只读诊断：不改任何控制逻辑，仅读变量 + 读 GPIO + 串口输出，可安全常驻。
- * 删除方法：删除本段 + uart_cmd.h 里那两行原型 + main.c 里那一行调用
- *           + FOC.C 里 [TEST] 标的几行（extern 声明、UartLog_FaultRecord 调用、
- *             UartLog_RecoverBlocked 的两处调用）。
- * ============================================================================ */
-/* 注：本模块自带故障码锁存，不依赖 dbg_monitor.h（避免主循环采样漏掉瞬时故障码） */
+/* ==================== 故障掩码上报（主循环调用）====================
+ * 打印一次故障事件触发过的全部保护位（掩码 + 名称），与 main.c 里按 fault_code
+ * 打印的 "FAULT: XXX" 互补——后者只反映最后一个写入者。 */
 
-#define UARTLOG_POLL_MS   5u    /* [TEST] 事件检测轮询间隔(ms) */
-#define UARTLOG_SNAP_MS   1000u /* [TEST] 周期快照间隔(ms) */
-#define UARTLOG_HIST      16u   /* [TEST] 故障记录环形缓冲深度（必须是 2 的幂） */
-
-typedef struct {
-    uint32_t t;          /* 触发时刻 HAL_GetTick */
-    uint8_t  code;       /* 触发瞬间的 fault_code */
-    uint8_t  mode;       /* 触发瞬间的 foc.mode（内部枚举） */
-    uint8_t  retry;      /* 触发瞬间的 fault_retry_cnt */
-    uint16_t mask;       /* 触发瞬间的 fault_mask（本次事件触发过的所有保护位） */
-    uint16_t st1, st2;   /* 触发瞬间锁存的 DRV8353 STATUS1/2 */
-} UartLog_FaultEvt_t;
-
-static volatile UartLog_FaultEvt_t log_hist[UARTLOG_HIST];
-static volatile uint8_t  log_hist_head = 0;   /* 生产者：中断钩子 */
-static volatile uint8_t  log_hist_tail = 0;   /* 消费者：本文件轮询 */
-static volatile uint32_t log_hist_lost = 0;   /* 缓冲满而丢弃的次数 */
-
-static uint32_t log_last_poll = 0, log_last_snap = 0;
-static uint8_t  log_p_mode = 0xFF, log_p_code = 0xFF, log_p_retry = 0xFF;
-static uint8_t  log_p_en = 0xFF, log_p_nfault = 0xFF, log_p_armed = 0xFF;
-
-static volatile uint8_t log_last_flt_code = 0;   /* 最近一次故障码（ISR 锁存，可靠） */
-static uint8_t  log_booted = 0;                  /* 首次调用时打印一次上电横幅/复位原因 */
-static uint8_t  log_vbus_valid = 0;              /* 母线电压统计窗口是否已初始化 */
-static float    log_vbus_min = 0.0f, log_vbus_max = 0.0f;  /* 快照窗口内母线电压极值 */
-static uint32_t log_vbus_lo_cnt = 0;             /* 窗口内低于欠压停机的采样次数(5ms/次) */
-
-static uint8_t  log_p_led = 0xFF;                /* 上一次 LED 电平：1=点亮(低电平) 0=熄灭 */
-static uint8_t  log_led1st_done = 0;             /* 1 = "闪灯起点"已打印，只打一次 */
-
-/* [TEST] 恢复被挡诊断（[RBLK]）：fault_recover_blocked() 只挡恢复、不置 fault_code、
- * 也无任何输出，是"灯一直闪、串口却没报错"的盲区。ISR 钩子记录被挡判据，主循环打印。
- * 判据与 FOC.c 的 fault_recover_blocked() 共用同一批阈值宏（Protect.h），改阈值即同步。 */
-#define UARTLOG_RBLK_NONE      0
-#define UARTLOG_RBLK_OVERTEMP  1
-#define UARTLOG_RBLK_BUS       2
-#define UARTLOG_RBLK_OVERSPEED 3
-#define UARTLOG_RBLK_I2T       4
-
-static volatile uint8_t  log_rblk_reason = 0;    /* 最近一次被挡的判据（UARTLOG_RBLK_*） */
-static volatile uint32_t log_rblk_cnt    = 0;    /* 被挡次数（钩子自增，供主循环判变化） */
-static uint32_t          log_p_rblk_cnt  = 0;    /* 上次打印时的被挡次数 */
-
-/* [TEST] 故障码 -> 名称（仅打印用） */
-static const char* UartLog_FaultName(uint8_t code)
+/* 故障码 -> 名称（仅打印用） */
+static const char* UART_FaultName(uint8_t code)
 {
     switch (code) {
         case FAULT_CODE_HARDWARE:      return "HARDWARE";
@@ -445,15 +390,15 @@ static const char* UartLog_FaultName(uint8_t code)
     }
 }
 
-/* [TEST] 故障掩码 -> 名称串（"A|B|C"）；无位时输出 "-" */
-static void UartLog_MaskToStr(uint16_t mask, char *out)
+/* 故障掩码 -> 名称串（"A|B|C"）；无位时输出 "-" */
+static void UART_MaskToStr(uint16_t mask, char *out)
 {
     out[0] = '\0';
     uint8_t first = 1u;
     for (uint8_t c = 1u; c <= 12u; c++) {
         if (mask & FAULT_MASK_BIT(c)) {
             if (!first) strcat(out, "|");
-            strcat(out, UartLog_FaultName(c));
+            strcat(out, UART_FaultName(c));
             first = 0u;
         }
     }
@@ -466,222 +411,11 @@ void UART_PrintFaultMask(uint16_t mask, uint8_t code)
 {
     static char masks[192];   /* 静态区：主栈仅 1KB，避免大数组上栈 */
     static char buf[256];
-    UartLog_MaskToStr(mask, masks);
+    UART_MaskToStr(mask, masks);
     sprintf(buf, "FAULT: code=%u(%s) mask=0x%03X {%s}\r\n",
-            (unsigned)code, UartLog_FaultName(code), (unsigned)mask, masks);
+            (unsigned)code, UART_FaultName(code), (unsigned)mask, masks);
     UART_SendString(buf);
 }
-
-/* [TEST] 故障记录入队：在 FOC_Update 的故障拦截里调用（20kHz 中断上下文，只写不阻塞） */
-void UartLog_FaultRecord(void)
-{
-    uint8_t next = (uint8_t)((log_hist_head + 1u) & (UARTLOG_HIST - 1u));
-    if (next == log_hist_tail) { log_hist_lost++; return; }   /* 满：丢最新并计数 */
-
-    log_hist[log_hist_head].t     = HAL_GetTick();
-    log_hist[log_hist_head].code  = fault_code;
-    log_hist[log_hist_head].mode  = (uint8_t)foc.mode;
-    log_hist[log_hist_head].retry = foc.fault_retry_cnt;
-    log_hist[log_hist_head].mask  = fault_mask;   /* 本次事件触发过的所有保护位 */
-    log_hist[log_hist_head].st1   = fault_status1;
-    log_hist[log_hist_head].st2   = fault_status2;
-    log_last_flt_code = fault_code;   /* ISR 侧锁存，供主循环可靠读取 */
-    log_hist_head = next;
-}
-
-/* [TEST] "恢复被挡"记录：FOC_Update / FOC_FaultRecoverProcess 在 fault_recover_blocked()
- * 返回 1 时调用。中断侧仅比较标量 + 写三个标量，非阻塞、不打印；打印在 UartLog_Poll。
- * 注意：此处判据的顺序与阈值必须与 FOC.c 的 fault_recover_blocked() 保持一致。 */
-void UartLog_RecoverBlocked(void)
-{
-    uint8_t r;
-    if (ntc_temperature > OVERTEMP_RECOVER) {
-        r = UARTLOG_RBLK_OVERTEMP;
-    } else if (bus_voltage > BUS_OVERVOLTAGE_RECOVER ||
-               bus_voltage < BUS_UNDERVOLTAGE_RECOVER) {
-        r = UARTLOG_RBLK_BUS;
-    } else if (fabsf(KTH7823_Speed_Rads) > OVERSPEED_RECOVER) {
-        r = UARTLOG_RBLK_OVERSPEED;
-    } else if (i2t_accum > I2T_RESET_THRESHOLD) {
-        r = UARTLOG_RBLK_I2T;
-    } else {
-        r = UARTLOG_RBLK_NONE;   /* 理论上不会走到（调用方只在返回 1 时调） */
-    }
-    log_rblk_reason = r;
-    log_rblk_cnt++;
-}
-
-/* [TEST] 主循环调用：自动上报（故障记录 + 事件 + 周期快照） */
-void UartLog_Poll(void)
-{
-    static char line[384];   /* 静态区：主栈仅 1KB，禁止把大数组放栈上（放大以容纳故障掩码串） */
-    uint32_t now = HAL_GetTick();
-
-    /* ---- 0) 上电横幅：只在首次调用打印，输出复位原因（判断复位循环的关键证据）----
-     * 注：复位标志在下次读之前会被清掉，所以这里打印后立刻清。
-     * 原始值直接给 CSR 十六进制，便于和参考手册逐位核对。 */
-    if (!log_booted) {
-        log_booted   = 1;
-        log_last_snap = now;             /* 首个快照从此刻起算 */
-        log_vbus_valid = 0;
-        sprintf(line,
-                "[BOOT] UartLog start t=%lums CSR=0x%08lX | PIN=%d BOR=%d SFT=%d IWDG=%d WWDG=%d LPWR=%d OBL=%d\r\n",
-                (unsigned long)now, (unsigned long)RCC->CSR,
-                (__HAL_RCC_GET_FLAG(RCC_FLAG_PINRST)  ? 1 : 0),
-                (__HAL_RCC_GET_FLAG(RCC_FLAG_BORRST)  ? 1 : 0),
-                (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST)  ? 1 : 0),
-                (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST) ? 1 : 0),
-                (__HAL_RCC_GET_FLAG(RCC_FLAG_WWDGRST) ? 1 : 0),
-                (__HAL_RCC_GET_FLAG(RCC_FLAG_LPWRRST) ? 1 : 0),
-                (__HAL_RCC_GET_FLAG(RCC_FLAG_OBLRST)  ? 1 : 0));
-        UART_SendString(line);
-        __HAL_RCC_CLEAR_RESET_FLAGS();
-    }
-
-    /* ---- 1) 故障记录：最高优先级，最短延迟打出来 ---- */
-    while (log_hist_tail != log_hist_head) {
-        uint32_t et  = log_hist[log_hist_tail].t;
-        uint8_t  ec  = log_hist[log_hist_tail].code;
-        uint8_t  em  = log_hist[log_hist_tail].mode;
-        uint8_t  er  = log_hist[log_hist_tail].retry;
-        uint16_t es1 = log_hist[log_hist_tail].st1;
-        uint16_t es2 = log_hist[log_hist_tail].st2;
-        uint16_t emk = log_hist[log_hist_tail].mask;
-        static char mstr[192];   /* 静态区：主栈仅 1KB */
-        UartLog_MaskToStr(emk, mstr);
-
-        sprintf(line, "[FLT] t=%lums code=%u(%s) mask=0x%03X{%s} mode=%u retry=%u ST1=0x%04X ST2=0x%04X lost=%lu\r\n",
-                (unsigned long)et, (unsigned)ec, UartLog_FaultName(ec),
-                (unsigned)emk, mstr,
-                (unsigned)em, (unsigned)er, es1, es2, (unsigned long)log_hist_lost);
-        UART_SendString(line);
-        log_hist_tail = (uint8_t)((log_hist_tail + 1u) & (UARTLOG_HIST - 1u));
-    }
-
-    /* ---- 2) 事件驱动：关键量变化立即打印 ---- */
-    if ((uint32_t)(now - log_last_poll) >= UARTLOG_POLL_MS) {
-        log_last_poll = now;
-
-        /* 母线电压极值/低压采样统计（5ms 一次）：用于判断供电是否在抖或掉 */
-        if (!log_vbus_valid) {
-            log_vbus_min    = bus_voltage;
-            log_vbus_max    = bus_voltage;
-            log_vbus_lo_cnt = 0;
-            log_vbus_valid  = 1;
-        } else {
-            if (bus_voltage < log_vbus_min) log_vbus_min = bus_voltage;
-            if (bus_voltage > log_vbus_max) log_vbus_max = bus_voltage;
-        }
-        if (bus_voltage < BUS_UNDERVOLTAGE_THRESHOLD) log_vbus_lo_cnt++;
-
-        uint8_t mode  = (uint8_t)foc.mode;
-        uint8_t code  = fault_code;
-        uint8_t retry = foc.fault_retry_cnt;
-        uint8_t en    = (HAL_GPIO_ReadPin(ENABLE_GPIO_Port, ENABLE_Pin) == GPIO_PIN_SET) ? 1u : 0u;
-        uint8_t nflt  = (HAL_GPIO_ReadPin(nFAULT_GPIO_Port, nFAULT_Pin) == GPIO_PIN_SET) ? 1u : 0u;
-        uint8_t armed = Protect_CommIsArmed();
-
-        if (mode  != log_p_mode  || code  != log_p_code || retry != log_p_retry ||
-            en    != log_p_en    || nflt  != log_p_nfault || armed != log_p_armed) {
-
-            sprintf(line,
-                "[EVT] t=%lums Mode=%u code=%u(%s) lastFLT=%u retry=%u EN=%u nFAULT=%u armed=%u commRX=%lu commSilent=%lu Vbus=%.2f\r\n",
-                (unsigned long)now, (unsigned)mode,
-                (unsigned)code, UartLog_FaultName(code),
-                (unsigned)log_last_flt_code, (unsigned)retry,
-                (unsigned)en, (unsigned)nflt, (unsigned)armed,
-                (unsigned long)comm_rx_count, (unsigned long)comm_silent_ticks, (double)bus_voltage);
-            UART_SendString(line);
-
-            log_p_mode = mode;  log_p_code = code;   log_p_retry = retry;
-            log_p_en = en;      log_p_nfault = nflt; log_p_armed = armed;
-        }
-
-        /* ---- 2b) 闪灯起点：只打印一次 ----
-         * 判据：进入 FAULT（foc.mode == FOC_STATE_FAULT）后 LED 的第一次电平跳变，
-         *       即 5Hz 闪烁的第一个沿（进入 FAULT 时 Run_OFF，或紧随其后的 100ms 翻转）。
-         * 目的：把"灯从哪一刻开始闪"和"那一刻是不是 COMM_TIMEOUT"一次性对上。
-         * 只打一次，不增加后续输出量。 */
-        {
-            uint8_t led = (HAL_GPIO_ReadPin(LED_GPIO_Port, LED_Pin) == GPIO_PIN_RESET) ? 1u : 0u;  /* 1=点亮 */
-            if (led != log_p_led) {
-                if (!log_led1st_done && foc.mode == FOC_STATE_FAULT) {
-                    log_led1st_done = 1;
-                    sprintf(line,
-                        "[LED1ST] t=%lums %s Mode=%u code=%u(%s) lastFLT=%u retry=%u EN=%u nFAULT=%u armed=%u commRX=%lu Vbus=%.2f\r\n",
-                        (unsigned long)now, (led ? "ON " : "OFF"),
-                        (unsigned)mode,
-                        (unsigned)code, UartLog_FaultName(code),
-                        (unsigned)log_last_flt_code, (unsigned)retry,
-                        (unsigned)en, (unsigned)nflt, (unsigned)armed,
-                        (unsigned long)comm_rx_count, (double)bus_voltage);
-                    UART_SendString(line);
-                }
-                log_p_led = led;
-            }
-        }
-
-        /* ---- 2c) 恢复被挡诊断：被挡次数变化即打印 ----
-         * 被挡判定本身约每 2s（重检延时）才发生一次，故天然限流，不会刷屏。
-         * 把"卡在 FAULT 却没有任何故障上报"的静默原因显式打出来。 */
-        {
-            if (log_rblk_cnt != log_p_rblk_cnt) {
-                log_p_rblk_cnt = log_rblk_cnt;
-                const char *blk =
-                    (log_rblk_reason == UARTLOG_RBLK_OVERTEMP)  ? "OVERTEMP"  :
-                    (log_rblk_reason == UARTLOG_RBLK_BUS)       ? "BUS"       :
-                    (log_rblk_reason == UARTLOG_RBLK_OVERSPEED) ? "OVERSPEED" :
-                    (log_rblk_reason == UARTLOG_RBLK_I2T)       ? "I2T"       : "-";
-                sprintf(line,
-                    "[RBLK] t=%lums block=%s cnt=%lu retry=%u | Vbus=%.2f(rec %.0f~%.0f) T=%.1f(rec<%.0f) spd=%.0f(rec<%.0f) i2t=%.1f(rec<%.0f)\r\n",
-                    (unsigned long)now, blk, (unsigned long)log_rblk_cnt,
-                    (unsigned)foc.fault_retry_cnt,
-                    (double)bus_voltage,
-                    (double)BUS_UNDERVOLTAGE_RECOVER, (double)BUS_OVERVOLTAGE_RECOVER,
-                    (double)ntc_temperature, (double)OVERTEMP_RECOVER,
-                    (double)KTH7823_Speed_Rads, (double)OVERSPEED_RECOVER,
-                    (double)i2t_accum, (double)I2T_RESET_THRESHOLD);
-                UART_SendString(line);
-            }
-        }
-    }
-
-    /* ---- 3) 周期快照：每 1s 两行，便于和上位机时间轴对齐 ---- */
-    if ((uint32_t)(now - log_last_snap) >= UARTLOG_SNAP_MS) {
-        log_last_snap = now;
-
-        FDCAN_ErrorCountersTypeDef ec;
-        (void)HAL_FDCAN_GetErrorCounters(&hfdcan2, &ec);
-
-        sprintf(line,
-            "[SNAP] t=%lums Mode=%u code=%u lastFLT=%u retry=%u EN=%u nFAULT=%u armed=%u txdrop=%lu\r\n",
-            (unsigned long)now, (unsigned)foc.mode,
-            (unsigned)fault_code, (unsigned)log_last_flt_code, (unsigned)foc.fault_retry_cnt,
-            (unsigned)((HAL_GPIO_ReadPin(ENABLE_GPIO_Port, ENABLE_Pin) == GPIO_PIN_SET) ? 1u : 0u),
-            (unsigned)((HAL_GPIO_ReadPin(nFAULT_GPIO_Port, nFAULT_Pin) == GPIO_PIN_SET) ? 1u : 0u),
-            (unsigned)Protect_CommIsArmed(), (unsigned long)UART_TxDropCount());
-        UART_SendString(line);
-
-        sprintf(line,
-            "       Vbus=%.2fV[min=%.2f max=%.2f lo<%.0fV:%lu] I=%.2f/%.2f/%.2f i2t=%.1f T=%.1f kthf=%u kthg=%u | CAN rx=%lu tx=%lu tec=%u rec=%u silent=%lu/%u\r\n",
-            (double)bus_voltage,
-            (double)log_vbus_min, (double)log_vbus_max,
-            (double)BUS_UNDERVOLTAGE_THRESHOLD, (unsigned long)log_vbus_lo_cnt,
-            (double)current_A, (double)current_B, (double)current_C,
-            (double)i2t_accum, (double)ntc_temperature, (unsigned)kth7823_raw_fault_cnt,
-            (unsigned)kth7823_unwrap_glitch_cnt,
-            (unsigned long)comm_rx_count, (unsigned long)fdcan_tx_count,
-            (unsigned)ec.TxErrorCnt, (unsigned)ec.RxErrorCnt,
-            (unsigned long)comm_silent_ticks, (unsigned)COMM_TIMEOUT_TICKS);
-        UART_SendString(line);
-
-        /* 统计窗口复位：下一个快照统计新的一秒 */
-        log_vbus_min    = bus_voltage;
-        log_vbus_max    = bus_voltage;
-        log_vbus_lo_cnt = 0;
-    }
-}
-/* ==================== END [TEST] 故障/状态自动串口上报 ==================== */
 
 /* ==================== 控制命令识别（启动自检硬件错误锁死门控用）====================
  * 命中返回 1：这些命令会驱动机器（对齐/开环/闭环/力矩等），需经过门控；

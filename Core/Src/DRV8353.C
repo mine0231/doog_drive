@@ -27,7 +27,7 @@ void DRV8353_WriteReg(uint8_t reg, uint16_t data)
     uint16_t rx = 0;
 
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_RESET);
-		DWT_DelayMs(1);
+		DWT_DelayUs(1);
     HAL_SPI_TransmitReceive(&hspi2, (uint8_t *)&tx, (uint8_t *)&rx, 1, 100);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_SET);
 }
@@ -41,7 +41,7 @@ uint16_t DRV8353_ReadReg(uint8_t reg)
     uint16_t rx = 0;
 
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_RESET);
-    DWT_DelayMs(1);
+    DWT_DelayUs(1);
     HAL_SPI_TransmitReceive(&hspi2, (uint8_t *)&tx, (uint8_t *)&rx, 1, 100);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_SET);
 

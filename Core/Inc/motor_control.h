@@ -15,8 +15,9 @@ extern "C" {
 #include <foc.h>
 #include <sense.h>
 
-extern volatile uint32_t control_tick;   // 控制节拍计数
-extern float control_dt;                 // 控制周期 (秒)
+extern volatile uint32_t control_tick;  // 控制节拍计数
+extern float control_dt;                // 控制周期 (秒)
+extern uint32_t s_tick; 								// 本控制拍的时间戳(ms)，每拍由 TIM1 回调刷新一次
 
 // 初始化与节拍
 void MotorControl_Init(void);

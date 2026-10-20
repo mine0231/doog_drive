@@ -50,24 +50,26 @@ void CurrentSense_Init(void)
 float CurrentSense_Calculate(uint16_t adc_raw)
 {
     // ADC 值转电压
-    float v_out = (float)adc_raw / ADC_MAX_VALUE * ADC_REF_VOLTAGE;
+    float v_out = (float)adc_raw / ADC_TO_Sense;
 	
     // 计算采样电阻压降（减去 VREF 偏置）
     float v_sense = v_out - INA240_VREF;
 	
     // 计算实际电流
-    float current = v_sense / (INA240_GAIN * R_SHUNT);		
+    float current = v_sense / ADC_TO_Sense2 ;		
 		
     return current;
 }
 
-//更新三相电流值（应在每个控制周期调用）
+//更新三相电流值
 void CurrentSense_Update(void)
 {
+    const float kA = I_K, bA = -(I_B0 + current_A_offset);
+    const float kB = I_K, bB = -(I_B0 + current_B_offset);
+
     // ADC 值由 DMA 自动更新
-    current_A = CurrentSense_Calculate(adc_values[0]) - current_A_offset;
-    current_B = CurrentSense_Calculate(adc_values[1]) - current_B_offset;
-    // C相电流由基尔霍夫电流定律计算
+    current_A = (float)adc_values[0] * kA + bA;
+    current_B = (float)adc_values[1] * kB + bB;
     current_C = -(current_A + current_B);
 
     // 母线电压（adc_values[2]）
@@ -82,10 +84,14 @@ void CurrentSense_Update(void)
         else if ((b <= a && a <= c) || (c <= a && a <= b)) med = a;
         else                                                med = c;
 
-        bus_voltage = ((float)med / ADC_MAX_VALUE) * ADC_REF_VOLTAGE * VOLTAGE_DIVIDER_RATIO;
+        bus_voltage = (float)med * Vbus_K ;
     }
-    
-	// NTC温度（adc_values[3]）—— 上拉接法：VCC→NTC→采样点→下拉电阻→GND
+}
+
+//更新温度
+void TempSense_Update(void){
+	
+		// NTC温度（adc_values[3]）—— 上拉接法：VCC→NTC→采样点→下拉电阻→GND
     uint16_t mos_raw = adc_values[3];
     if (mos_raw == 0) mos_raw = 1;  // 防除零（低温时 NTC 阻值大，采样电压趋近 0）
     float mos_ntc = PULL_DOWN_RES * (ADC_MAX_VALUE - (float)mos_raw) / (float)mos_raw;
@@ -101,7 +107,7 @@ void CurrentSense_Update(void)
     float temp_k_2 = 1.0f / ((1.0f / NTC_T0) + (1.0f / NTC_B) * logf(r_ntc / NTC_R0));
     ntc_temperature = temp_k_2 - 273.15f;
 }
-
+	
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) // 仅 Init 期探测用，置位后不再清零，不代表"每帧就绪"
 {
     if (hadc->Instance == ADC1) {

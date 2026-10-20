@@ -723,6 +723,164 @@ ol_move_and_hold(90.0, 5.0, 0.6, hold_seconds=2.0)
 
 ## 更新记录
 
+### 2026-10-20 — FOC 20kHz 控制中断（ISR）复查：统一时间基准、nFAULT 快速停机、浮点算力优化
+
+**背景**：对 TIM1 更新中断（20kHz / 50µs 一拍）做一次完整复查，关注三件事：
+
+1. **一拍内的时间基准是否一致**——此前 ISR 里散落 8~10 次 `HAL_GetTick()`，跨毫秒边界时同一拍会拿到两个值，
+   故障计时与状态机判定都在中断里，容易出现 ±1ms 的抖动与不可推理的边界。
+2. **nFAULT（EXTI，优先级 0，高于 TIM1 的 1）的干扰关系**——原回调先做 2 次 `DRV8353_ReadReg`
+   （各含 `DWT_DelayUs(100)` + 阻塞 SPI），约 **220µs 后**才执行第一条停机动作；期间压住 4~5 个控制周期，
+   且会与主循环 `DRV8353_Recover()` 争用同一路 SPI2。
+3. **一拍内的浮点算子**（`VDIV` / `VSQRT` / `fmodf` / CMSIS 三角）是否存在白算的部分。
+
+本批只做"等效改写 + 时间基准统一"，**控制器参数、保护阈值、状态机行为均零变化**。
+
+**改动**
+
+**1. 中断时间基准统一为 `s_tick`**
+
+- `Core/Src/motor_control.c`：新增 `uint32_t s_tick`；`HAL_TIM_PeriodElapsedCallback()` 的 TIM1 分支入口
+  先 `s_tick = HAL_GetTick()`，**一拍只取一次**。
+- `Core/Inc/motor_control.h`：`extern uint32_t s_tick;`。
+- `Core/Src/FOC.C`：ISR 侧全部计时改用 `s_tick`——开环转角度/悬停（`ol_move_t0` / `ol_pull_t0`）、
+  对齐窗口（`align_step_time` / `align_accumulate`）、故障退避（`fault_recover_time`、稳定期判定）、
+  `led_blink_tick`；`Core/Src/Protect.c` 的编码器停转计时同步改用。
+- **刻意的例外**：`FOC_Update()` 里"硬件恢复完成"处的 `foc.last_recover_tick = HAL_GetTick()`
+  保留取"此刻"，因为它的用途是与 16s 稳定窗口比较，1ms 级差异无影响（已在代码注释中标明）。
+  主循环侧（`FOC_FaultRecoverProcess()`、`DBG_Monitor_Update()`、`uart_cmd.c`）继续用 `HAL_GetTick()`。
+- `FOC.C` 的 `led_blink_tick` 加 `volatile`。
+
+**2. nFAULT 故障路径重构（最快停机 + 状态可诊断）**
+
+`Core/Src/main.c` `HAL_GPIO_EXTI_Callback()` 顺序改为：
+
+```c
+TIM1->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC3E);  // ① 立即封锁三相输出（约 10 个周期）
+TIM1->BDTR &= ~TIM_BDTR_MOE;
+if (hspi2.State == HAL_SPI_STATE_READY) {                        // ② 仅在 SPI 空闲时读
+    fault_status1 = DRV8353_ReadReg(DRV8353_REG_STATUS1);         //    必须先读后关 EN
+    fault_status2 = DRV8353_ReadReg(DRV8353_REG_STATUS2);         //    （EN 拉低会复位寄存器）
+    fault_status_valid = 1;
+} else {
+    fault_status_valid = 0;                                      //    主循环 SPI 被占用，放弃本次读取
+}
+DRV8353_Disable();                                               // ③ 关栅极驱动
+fault_code = FAULT_CODE_HARDWARE;                                // ④ 通知控制环
+fault_triggered = 1;
+```
+
+- 新增 `volatile uint8_t fault_status_valid`（`main.c`）：为 0 时上报
+  `FAULT: HW (STATUS unavailable: SPI busy at nFAULT)`，不再把上一次故障的 STATUS 位当作本次结果打印。
+- `Core/Src/Protect.c` `Protect_StopPWM()`：3 次 `HAL_TIM_PWM_Stop()` 改为直写 `TIM1->CCER` / `TIM1->BDTR`；
+  同时删掉为抵消 `HAL_TIM_PWM_Stop` 副作用而补的 `__HAL_TIM_ENABLE(&htim1)`（CEN 由
+  `HAL_TIM_Base_Start_IT()` 与 `HAL_TIM_PWM_Start()` 负责，计数器必须持续运行以维持 20kHz 中断与 ADC 触发）。
+- `Core/Src/DRV8353.C`：`DRV8353_ReadReg` / `DRV8353_WriteReg` 的 CS 建立延时
+  `DWT_DelayUs(100)` → `DWT_DelayUs(1)`（单次寄存器访问省约 100µs，nFAULT 回调与上电自检同步受益）。
+
+**3. `LED_Update()` 回归 20kHz 控制中断**
+
+- `Core/Src/motor_control.c`：TIM1 分支恢复为 `if (motor_ready) { FOC_Update(); LED_Update(); }`。
+- `Core/Src/main.c`：删除主循环末尾的 `LED_Update()` 调用（末尾只剩 `HAL_IWDG_Refresh()`）。
+- `Core/Src/FOC.C` `LED_Update()`：`now` 由 `HAL_GetTick()` 改为 `s_tick`，与故障分支的 `led_blink_tick` 同源。
+- 原因：主循环的 `UART_Cmd_Process()`（串口 `ang=` 测试最长 ≈8s）与 `DRV8353_Recover()`（≈12ms）期间
+  LED 会冻结、故障闪烁丢失；回归中断后任何情况下都能看见指示，代价约 0.5µs/拍（≈1% 的 50µs 预算）。
+
+**4. 浮点算力优化（等效改写，结果不变）**
+
+- `Core/Inc/sense.h`：新增 `I_K` / `I_B0` / `Vbus_K` 预计算常数。
+- `Core/Src/sense.c`：`CurrentSense_Update()` 由"每相 2 次 `VDIV`"改为一次乘加
+  `current_x = adc_values[i] * I_K - (I_B0 + offset)`；`bus_voltage` 改为 `med * Vbus_K`。
+  `CurrentSense_Calculate()` 保留给上电 64 次零偏标定。
+- `Core/Src/FOC.C` `FOC_Clark()`：`/(1.73205f)` → `*0.57735027f`。
+- `Core/Src/FOC.C` 电压限幅/归一化重写：
+
+  ```c
+  float V_max   = vbus * 0.57735027f;      // Vdc/√3，无除法
+  float inv_max = 1.0f / V_max;            // 全拍唯一一次 VDIV
+  float vd_n = foc.Vd * inv_max, vq_n = foc.Vq * inv_max;
+  float mag2 = vd_n * vd_n + vq_n * vq_n;  // 平方比较，常规路径不开方
+  if (mag2 > 1.0f) { float k = 1.0f / sqrtf(mag2); vd_n *= k; vq_n *= k; foc.Vd *= k; foc.Vq *= k; }
+  ```
+
+  常规路径由 1×`VSQRT` + 3×`VDIV` 降为 1×`VDIV`。
+
+- `Core/Src/FOC.C` 新增 `FOC_NormAngle()`（乘 1/2π → 截断取整 → 回代 → 补正），替代 `fmodf()`；
+  开环 `FOC_OL_NormElecAngle()` 与闭环电角度计算均改用它。
+- `Core/Src/PID.c`：微分项加 `if (pid->params.Kd != 0.0f)` 短路（`Kd=0` 时不再执行除法）；
+  微分算子修正为 `/ dt`（此前误写成 `* dt`，因当前四个环 `Kd` 全为 0 而未暴露）。
+- `Core/Src/Protect.c`：堵转判定由 `sqrtf(i_mag²)` 改为平方比较；`i_mag2` 提为全局，
+  `Protect_I2tCheck()` 直接复用（不再重复算 3 次乘法）。
+
+**影响**
+
+- 控制行为、保护阈值、状态机与 CAN / 串口协议**零变化**：全部为等效算式与时间基准统一；
+  `s_tick` 与 `HAL_GetTick()` 同为 1ms 分辨率，所有毫秒阈值语义不变。
+- nFAULT 回调时长由 ≈220µs 降到 ≈15µs：第一条停机动作提前约 220µs，不再压住 4~5 个控制周期，
+  也不再与主循环 `DRV8353_Recover()` 争用 SPI2（SPI 忙时放弃读取并标记为不可信）。
+- LED 指示在串口阻塞命令与故障恢复期间不再冻结。
+- ISR 浮点开销下降（开环估算约 150~200 周期 ≈ 2~3µs），为后续开闭环留余量。
+
+**验证**：Keil 编译无 Error；实测项——
+
+1. 逻辑分析仪/示波器观察 TIM1 中断占用 < 50µs，或用 `DWT->CYCCNT` 打点记录 `isr_cyc_max`；
+2. 人为触发 nFAULT 后 `TIM1->CCER == 0`、`BDTR.MOE == 0`，串口上报具体故障位或 `STATUS unavailable`；
+3. 串口 `v=0.5` 起转 LED 常亮；制造故障后 5Hz 闪烁；执行 `ang=` 阻塞命令期间故障仍能正常闪；
+4. `control_dt` 仍为 50.00µs，开环转角度/悬停与改动前行为一致。
+
+**遗留（下一批，按优先级）**
+
+1. `fault_triggered` 的"读-清"无临界区：EXTI 优先级 0 高于 TIM1，若插在
+   `if (fault_triggered) { fault_triggered = 0; }` 之间会丢失新故障事件（表现为已停机但不进
+   `FOC_STATE_FAULT`、不自动恢复）。
+2. ADC 触发仍在 UEV（`T1_TRGO`）：采样点正好落在三相同时换向的时刻，且 ISR 读到的是上一拍数据，
+   叠加 CCR 预装载（`OCxPE`）→ 电流环纯延迟约 2 拍（100µs）。建议改 TRGO2/CC4 偏移触发（零矢量中段）。
+3. 温度更新位于主循环（`main.c` 的 `TempSense_Update()`，≈1kHz）：过温保护本身有效，但串口 `ang=`
+   阻塞（最长 ≈8s，且正是带电流保持的工况）与 `DRV8353_Recover()`（≈12ms）期间温度不刷新，
+   判定存在盲区。建议改到 20kHz 中断内按 20~50ms 分频调用，或在这两条阻塞路径里补调用。
+4. SVPWM 现存三个 `switch`（sector→S、S→T1/T2、S→Ta/Tb/Tc），可换零序注入（min/max 中点钳位），
+   需用示波器比对占空比等效性。
+5. Park / 逆 Park 各算一次 `sin/cos`，可共用一次（闭环一拍白算一组）。
+6. 保护巡检未分频（8 项全在 20kHz 跑）；若降频，`Protect.h` 的 `*_TICKS` 需同步 ÷10。
+7. `TIM1_UP_TIM16_IRQHandler` 仍走 `HAL_TIM_IRQHandler` 的 8 路 flag 分发，可直连 `UIF`。
+8. `SysTick` 的 `TICK_INT_PRIORITY` 仍为 0（`stm32g4xx_hal_conf.h`），会排在 TIM1 之前，建议改 15。
+9. 闭环前置：换相角度源仍由主循环 1kHz 刷新，额定转速下电角频率 ≈639Hz 存在混叠，
+   开 `FOC_CLOSEDLOOP_ENABLE` 前必须先提高角度刷新率。
+
+**关联文件**：`Core/Src/motor_control.c`、`Core/Inc/motor_control.h`、`Core/Src/FOC.C`、`Core/Inc/FOC.H`、
+`Core/Src/Protect.c`、`Core/Src/main.c`、`Core/Src/DRV8353.C`、`Core/Src/PID.c`、`Core/Src/sense.c`、
+`Core/Inc/sense.h`。
+
+### 2026-10-20 — 删除 `UartLog` 故障/状态自动串口上报模块
+
+**背景**：`UartLog_Poll()` 这一套是为定位"灯在闪、串口却没输出"临时加的诊断上报——主循环轮询
+（`[EVT]`/`[LED1ST]`/`[RBLK]`/`[SNAP]`，含上电横幅 `[BOOT]`）+ 两个 ISR 钩子把故障事件入队后打印 `[FLT]`。
+定位完成后不再需要，整体删除。
+
+**改动**
+
+- `Core/Src/uart_cmd.c`：删除整个 `[TEST] 故障/状态自动串口上报` 段——
+  `UARTLOG_POLL_MS` / `UARTLOG_SNAP_MS` / `UARTLOG_HIST` / `UARTLOG_RBLK_*` 宏、`UartLog_FaultEvt_t`
+  故障记录环形缓冲及全部静态状态（`log_hist*` / `log_p_*` / `log_vbus_*` / `log_rblk_*` / `log_booted` 等）、
+  `UartLog_FaultRecord()`、`UartLog_RecoverBlocked()`、`UartLog_Poll()`。
+  原 `UartLog_Poll()` 首次调用会打印复位原因横幅并 `__HAL_RCC_CLEAR_RESET_FLAGS()`，一并移除。
+- `Core/Inc/uart_cmd.h`：删除 `UartLog_Poll()`、`UartLog_RecoverBlocked()` 原型。
+- `Core/Src/main.c`：删除主循环中已注释的 `UartLog_Poll();` 及其 `[TEST]` 注释行。
+- `Core/Src/FOC.C`：删除两条 `extern` 声明、故障拦截里的 `UartLog_FaultRecord()` 调用，以及中断侧与
+  `FOC_FaultRecoverProcess()` 里两处 `UartLog_RecoverBlocked()` 调用。
+- **保留**：`UART_PrintFaultMask()`（故障掩码上报，与 `main.c` 按 `fault_code` 打印的 `FAULT: XXX` 互补），
+  其两个内部辅助函数由 `UartLog_FaultName` / `UartLog_MaskToStr` 改名为 `UART_FaultName` / `UART_MaskToStr`。
+
+**影响**
+
+- 控制与保护逻辑零改动：删掉的只有诊断输出和两个"只写标量、不参与判定"的 ISR 钩子；
+  `fault_recover_blocked()` 的判据、退避计时与 `FOC_STATE_FAULT` 状态机保持原样。
+- 串口不再有 5 ms 事件行与 1 s 周期快照；在线观察改用 `status` / `fault` / `can` 命令与 Keil Watch（`dbg`）。
+- 固件代码（`Core/`）检索确认无 `UartLog` / `UARTLOG_*` / `log_hist*` / `log_rblk*` / `log_vbus*` /
+  `[FLT]` / `[EVT]` / `[SNAP]` / `[RBLK]` / `[LED1ST]` 残留。
+
+**关联文件**：`Core/Src/uart_cmd.c`、`Core/Inc/uart_cmd.h`、`Core/Src/main.c`、`Core/Src/FOC.C`。
+
 ### 2026-10-19 — `0x300` 新增「转动到位」主动上报事件（`0x09` 查询帧保持不变）
 
 **背景**：`0x07` 开环转角度+悬停原来只能靠上位机周期发 `0x09` 轮询判到位——轮询慢会漏判/延迟，轮询快又占带宽。
@@ -890,8 +1048,7 @@ ol_move_and_hold(90.0, 5.0, 0.6, hold_seconds=2.0)
 - `main.c`：定义 `fault_mask`；主循环上报分支在 `UART_PrintFaultMask(fault_mask, fault_code)` 之后
   与 `fault_code` **同步清零**。
 - `uart_cmd.c`：新增 `UART_PrintFaultMask()`，打印 `FAULT: code=u(name) mask=0xXXX {A|B|C}`
-  （多位用 `|` 拼接，无位输出 `-`）；`UartLog_FaultEvt_t` 增加 `mask` 字段，`[FLT]` 历史记录行增加
-  `mask=0xXXX{...}`；`line` 缓冲 288 → 384 字节，掩码串改静态数组（主栈仅 1KB）。
+  （多位用 `|` 拼接，无位输出 `-`；掩码串用静态数组，主栈仅 1KB）。
 - `dbg_monitor.h` / `FOC.C`：`DBG_Monitor_t` 增加 `fault_mask`，`DBG_Monitor_Update()` 同步赋值，
   Keil Watch 中可直接查看本次事件触发过的全部保护。
 
@@ -903,8 +1060,9 @@ ol_move_and_hold(90.0, 5.0, 0.6, hold_seconds=2.0)
 **失联计时可观测（`comm_silent_ticks`）**
 
 - `Protect.c`：`comm_silent_ticks` 由 `static` 改为 `volatile` 全局（收到新帧即清零）；`Protect.h` 补 `extern` 声明。
-- `uart_cmd.c`：`[EVT]` 行增加 `commSilent=<当前静默节拍>`；周期快照行增加
-  `silent=<当前节拍>/<COMM_TIMEOUT_TICKS>`，联机时可看到失联保护计时走到哪一步。
+- ~~`uart_cmd.c`：`[EVT]` 行增加 `commSilent=<当前静默节拍>`；周期快照行增加
+  `silent=<当前节拍>/<COMM_TIMEOUT_TICKS>`~~：这两处输出属于 `UartLog` 自动上报模块，已随该模块
+  于 2026-10-20 整体删除；`comm_silent_ticks` 仍在 `Protect` 内部维护，可在 Keil Watch 中查看。
 
 **调试（有意变更）**：`main.c` 主循环的 `DBG_Monitor_Update();` 当前处于**注释**状态
 （Keil Watch 里的 `dbg` 会停留在最后一次刷新的值）；需要时取消注释即恢复每循环刷新。

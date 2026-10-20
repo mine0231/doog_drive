@@ -22,6 +22,13 @@
 #define NTC_B       3950.0f    // B值, 单位: K
 #define PULL_DOWN_RES 10000.0f // 下拉电阻（NTC 上拉接法：VCC→NTC→采样点→下拉电阻→GND）, 单位: 欧姆
 
+// ADC转换预计算
+#define ADC_TO_Sense		(ADC_MAX_VALUE * ADC_REF_VOLTAGE)
+#define ADC_TO_Sense2		(INA240_GAIN * R_SHUNT)
+#define I_K				    	(1.0 / (ADC_MAX_VALUE * ADC_REF_VOLTAGE * INA240_GAIN * R_SHUNT))
+#define I_B0            (INA240_VREF / (INA240_GAIN * R_SHUNT)) 	
+#define Vbus_K					(ADC_REF_VOLTAGE * VOLTAGE_DIVIDER_RATIO / ADC_MAX_VALUE)
+
 // ADC 原始采样值（DMA 填充，调试观察用）
 extern volatile uint16_t adc_values[4];    // [0]A相电流 [1]B相电流 [2]母线电压 [3]MOSFET温度
 extern volatile uint16_t adc2_values[1];   // [0]NTC 线圈温度
@@ -31,11 +38,12 @@ extern volatile float current_A;   // A相电流 (A)
 extern volatile float current_B;   // B相电流 (A)
 extern volatile float current_C;   // C相电流 (A)
 extern volatile float bus_voltage;      // 母线电压 (V)
-extern volatile float mos_temperature;  // 线圈温度 (℃)
+extern volatile float mos_temperature;  // MOS温度 (℃)
 extern volatile float ntc_temperature;  // 线圈温度 (℃)
 
 void CurrentSense_Init(void);
 void CurrentSense_Update(void);
+void TempSense_Update(void);
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc);
 float CurrentSense_Calculate(uint16_t adc_raw);
 

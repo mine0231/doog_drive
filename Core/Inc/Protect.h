@@ -72,6 +72,7 @@
 // 远小于 45° 安全上限，电气跟踪无压力。
 #define OVERSPEED_THRESHOLD   230.0f   // 超速停机阈值 (rad/s)，≈1.2×电机轴额定
 #define OVERSPEED_RECOVER     200.0f   // 恢复阈值 (rad/s)，≈1.05×额定，滞回 30
+#define OVERSPEED_RECOVER_RECHECK_DELAY   2000       
 
 // 超速"连续 N 拍确认"：抑制编码器解包裹跳变导致的单拍速度尖峰误触发。
 // 依据：速度低通 α=SPEED_FILTER_ALPHA(0.15)、刷新 10kHz；最坏单次跳变(Δ=π → 原始 31416 rad/s)

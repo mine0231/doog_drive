@@ -21,6 +21,7 @@
 extern float manual_voltage;   // 手动给定电压 (V)（定义于 main.c）
 extern float manual_speed;     // 手动给定速度 (rad/s)（定义于 main.c）
 
+uint32_t s_tick = 0; // 同一拍内时间戳一致
 static uint8_t boot_hw_error = 0;   // 1 = 上电自检三次仍不通过，硬件错误（锁死控制命令，需检修）
 
 volatile uint32_t control_tick = 0;
@@ -95,13 +96,15 @@ void MotorControl_Init(void)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM1) {
-
+			
+		s_tick = HAL_GetTick(); 	// 当前中断时间戳
+			
     CurrentSense_Update();	
 
     // 执行 FOC 算法（电流偏移校准完成前不执行，避免初始化期误触发保护）
     if (motor_ready) {
-        FOC_Update();
-        LED_Update();   // LED 状态机：20kHz 持续刷新，不受主循环阻塞影响
+        FOC_Update();					
+				LED_Update();  // LED 状态机
     }
 
     control_tick++;

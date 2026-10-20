@@ -8,10 +8,6 @@
 #include "motor_control.h"
 #include "arm_math.h"
 
-void UartLog_FaultRecord(void);      // [TEST] 定义于 uart_cmd.c（故障记录入队）；删除本模块时一并删除本行
-void UartLog_RecoverBlocked(void);   // [TEST] 定义于 uart_cmd.c（恢复被挡诊断）；删除本模块时一并删除本行
-
-
 #define ALIGN_VOLTAGE       0.6f    // 对齐电压 (V)，用于将转子拉到目标位置
 #define ALIGN_STEP_DELAY    800     // 每步对齐持续时间 (ms)
 #define ALIGN_AVG_MS        200     // 每步末尾用于"平均定位"的时间窗口 (ms)，< ALIGN_STEP_DELAY，且远大于转子残余振荡周期
@@ -42,7 +38,7 @@ volatile uint32_t align_report_samples  = 0;    // 本次窗口平均用到的�
 
 volatile uint8_t arrive_report_pending = 0;   // 转动到位事件：待主循环主动上报
 
-static uint32_t led_blink_tick = 0;    // LED 闪烁计时基准(ms)，进入 FAULT 时重置
+volatile uint32_t led_blink_tick = 0;    // LED 闪烁计时基准(ms)，进入 FAULT 时重置
 extern float control_dt;       // 控制周期 (秒)，由 motor_control.c 提供
 extern volatile float bus_voltage;			//母线电压采样
 extern volatile float KTH7823_Angle_Rad;
@@ -77,7 +73,7 @@ static void align_accum_reset(void)
 static void align_accumulate(void)
 {
     if (align_step_time == 0) return;                                        // 计时未启动
-    if ((HAL_GetTick() - align_step_time) < (ALIGN_STEP_DELAY - ALIGN_AVG_MS)) return;
+    if ((s_tick - align_step_time) < (ALIGN_STEP_DELAY - ALIGN_AVG_MS)) return;
 
     align_sum_sin += arm_sin_f32(KTH7823_Angle_Rad);
     align_sum_cos += arm_cos_f32(KTH7823_Angle_Rad);
@@ -190,7 +186,7 @@ void FOC_Init(void)
 void FOC_Clark(void)
 {
 	foc.I_alpha = foc.Ia;
-	foc.I_beta = (foc.Ib - foc.Ic) / 1.73205f;
+	foc.I_beta = (foc.Ib - foc.Ic) * 0.57735027f;
 }
 
 //Park 变换：静止坐标系 → 旋转坐标系
@@ -208,7 +204,7 @@ void FOC_InversePark(void)
 {
 	float cos_theta = arm_cos_f32(foc.angle);
 	float sin_theta = arm_sin_f32(foc.angle);
-
+	
 	foc.V_alpha = foc.Vd_norm * cos_theta - foc.Vq_norm * sin_theta;
 	foc.V_beta = foc.Vd_norm * sin_theta + foc.Vq_norm * cos_theta;
 }
@@ -281,6 +277,17 @@ void FOC_SVPWM(void)
 	foc.Tc = Tc;
 }
 
+// 电角度归一化[0, 2π]
+float FOC_NormAngle(float a)
+{
+    float n = a * FOC_OL_INV_TWO_PI;
+    n = (float)(int32_t)n;          /* 向零截断 */
+    a -= n * FOC_OL_TWO_PI;
+
+    if (a < 0.0f) a += FOC_OL_TWO_PI;
+    return a;
+}
+
 /* ==================== 开环"转到指定输出端角度 + 到位悬停保持"（电弹簧）====================
  *   - RUN  ：开环无位置反馈，靠对"命令电角度速率 target_speed_ramp"按控制节拍定步长积分判到位
  *            （与同一中断内推进 openloop_angle 同源）；输出端机械角 -> 电机轴(×减速比) -> 电角度(×极对数)。
@@ -293,12 +300,10 @@ void FOC_SVPWM(void)
  * 全部在 20kHz 控制中断内非阻塞推进：每拍 O(1)，无循环/等待/动态内存，ISR 安全。
  */
 
-// 电角度归一化到 [0, 2π)（与 FOC_Update 开环分支一致）
+// 开环转动辅助归一化
 static float FOC_OL_NormElecAngle(float a)
 {
-	a = fmodf(a, FOC_OL_TWO_PI);
-	if (a < 0.0f) a += FOC_OL_TWO_PI;
-	return a;
+	return FOC_NormAngle(a);
 }
 
 // 当前转子电角度（与 FOC_SetMode 进入开环时的表达式/角度源完全一致）
@@ -366,7 +371,7 @@ static void FOC_OpenLoopMoveHold_Service(void)
 				foc.openloop_move_remain    = 0.0f;
 				foc.openloop_move_state     = FOC_OL_MOVE_HOLD;   // 无限期保持，由 v=0 / 切模式释放
 				arrive_report_pending    = 1;  // 置标志：主循环主动上报到位事件
-			} else if ((HAL_GetTick() - ol_move_t0) >= FOC_OL_MOVE_TIMEOUT_MS) {
+			} else if ((s_tick - ol_move_t0) >= FOC_OL_MOVE_TIMEOUT_MS) {
 				// 运动超时（未转够）：不进入悬停，直接断电释放
 				FOC_OL_Release();
 			}
@@ -389,7 +394,7 @@ static void FOC_OpenLoopMoveHold_Service(void)
 				ol_pull_speed        = (dev > 0.0f) ? -FOC_OL_HOLD_PULL_SPEED : FOC_OL_HOLD_PULL_SPEED;
 				foc.target_speed     = ol_pull_speed;
 				foc.openloop_voltage = ol_hold_voltage;
-				ol_pull_t0           = HAL_GetTick();
+				ol_pull_t0           = s_tick;
 				foc.openloop_move_state = FOC_OL_MOVE_PULL;
 			}
 			// 注意：悬停不按时间自动释放，会一直保持到 v=0（0x02 电压为 0）或离开开环模式
@@ -404,7 +409,7 @@ static void FOC_OpenLoopMoveHold_Service(void)
 
 			if (fabsf(dev) <= hyst ||
 			           ((dev > 0.0f) != (ol_pull_speed < 0.0f)) ||
-			           ((HAL_GetTick() - ol_pull_t0) >= FOC_OL_HOLD_PULL_TIMEOUT_MS)) {
+			           ((s_tick - ol_pull_t0) >= FOC_OL_HOLD_PULL_TIMEOUT_MS)) {
 				// 回到滞环内 / 已越过到位点(偏差变号) / 单次回拉超时：重新冻结保持
 				foc.target_speed      = 0.0f;
 				foc.target_speed_ramp = 0.0f;
@@ -427,7 +432,7 @@ static void FOC_OpenLoopMoveHold_Service(void)
 	}
 }
 
-// 启动一次"开环转动 + 到位悬停保持"。out_rad 为减速器输出端目标角度(rad)，0 忽略。
+// 启动一次"开环转动 + 到位悬停保持"。out_rad 为减速器输出端目标角度(rad)，0 忽略
 // 说明：内部会调用 FOC_SetMode(FOC_STATE_OPENLOOP) 保证状态一致；
 //       速度/电压优先复用当前给定(foc.target_speed/foc.openloop_voltage)，未设定则用缺省值。
 void FOC_StartOpenLoopMoveHold(float out_rad)
@@ -460,7 +465,7 @@ void FOC_StartOpenLoopMoveHold(float out_rad)
 	foc.openloop_move_hold_mech = KTH7823_Angle_Multiturn;   // 悬停点先占位，到位时再刷新
 
 	ol_hold_voltage = hold_vol;
-	ol_move_t0      = HAL_GetTick();
+	ol_move_t0      = s_tick;
 
 	foc.openloop_move_stop_req = 0;                 // 清除可能残留的中止请求（FOC_SetMode 会置位）
 	foc.openloop_move_state    = FOC_OL_MOVE_RUN;   // 最后一步：使能状态机
@@ -498,7 +503,7 @@ static uint8_t fault_recover_blocked(uint32_t *recheck_delay)
 		return 1;
 	}
 	if (fabsf(KTH7823_Speed_Rads) > OVERSPEED_RECOVER) {
-		*recheck_delay = BUS_VOLTAGE_RECHECK_DELAY;
+		*recheck_delay = OVERSPEED_RECOVER_RECHECK_DELAY;
 		return 1;
 	}
 	if (i2t_accum > I2T_RESET_THRESHOLD) {
@@ -515,12 +520,11 @@ void FOC_Update(void)
 	foc.speed = KTH7823_Speed_Rads;	    // 当前转速 (rad/s)
 	foc.Ia = current_A; // 当前A相电流
 	foc.Ib = current_B;
-	foc.Ic = current_C;
+	foc.Ic = current_C; 
 
 	// ---- 故障拦截：任意保护触发即进入 FAULT 状态（非阻塞退避）----
 	if (fault_triggered) {
 		fault_triggered = 0;
-		UartLog_FaultRecord();   // [TEST] 记录本次触发的故障码/状态（删除本模块时一并删除本行）
 		// 无条件作废尚未完成的恢复握手：DRV8353_Recover() 已挪到主循环执行，
 		// "中断判定可恢复"到"主循环执行完/中断收尾"之间存在间隔，期间任何新故障都说明
 		// 故障源未排除，必须放弃本次恢复。主循环据此在 Recover() 返回后立刻重新关断驱动。
@@ -529,24 +533,24 @@ void FOC_Update(void)
 			foc.mode = FOC_STATE_FAULT;
 			foc.fault_retry_cnt++;
 			// 指数退避：1次→2s, 2次→4s, 3次→8s ... 封顶 16s
-			foc.fault_recover_time = HAL_GetTick() + fault_backoff_delay(foc.fault_retry_cnt);
+			foc.fault_recover_time = s_tick + fault_backoff_delay(foc.fault_retry_cnt);
 			// 立即停输出（PWM 已在 Protect 里被 Disable/Stop，这里双重保险）
 			TIM1->CCR1 = 0; TIM1->CCR2 = 0; TIM1->CCR3 = 0;
 			Run_OFF();                      // 进入故障先熄灭，作为闪烁起点
-			led_blink_tick = HAL_GetTick(); // 重置闪烁计时基准
+			led_blink_tick = s_tick; // 重置闪烁计时基准
 		} else {
 			// 已在 FAULT 中又触发故障：一律截断当前冷却并按新的连续故障次数重新退避。
 			// 覆盖两种情形：①冷却期间 nFAULT 反复抖动；②恢复请求/硬件恢复刚完成、
 			// 模式尚未切回时又报故障——后者若不重新退避，会在下一次判定时立刻再次恢复，形成冲击循环。
 			foc.fault_retry_cnt++;
-			foc.fault_recover_time = HAL_GetTick() + fault_backoff_delay(foc.fault_retry_cnt);
+			foc.fault_recover_time = s_tick + fault_backoff_delay(foc.fault_retry_cnt);
 		}
 	}
 
 	// ---- 故障恢复后稳定运行超过最大退避时长，重置连续故障计数（避免 fault_retry_cnt 永久封顶 16s）----
 	if (foc.mode != FOC_STATE_FAULT &&
 	    foc.last_recover_tick != 0 &&
-	    (HAL_GetTick() - foc.last_recover_tick) > FAULT_RETRY_DELAY_MAX) {
+	    (s_tick - foc.last_recover_tick) > FAULT_RETRY_DELAY_MAX) {
 		foc.fault_retry_cnt = 0;
 		foc.last_recover_tick = 0;
 	}
@@ -609,8 +613,8 @@ void FOC_Update(void)
 					foc.Vd = ALIGN_VOLTAGE;  
 					foc.Vq = 0.0f;
 					foc.angle = 0.0f;
-					if (align_step_time == 0) align_step_time = HAL_GetTick();
-					if (HAL_GetTick() - align_step_time > ALIGN_STEP_DELAY) {
+					if (align_step_time == 0) align_step_time = s_tick;
+					if (s_tick - align_step_time > ALIGN_STEP_DELAY) {
 						start_angle_raw = align_average_angle();   // 窗口平均，非单点
 						align_step = ALIGN_STEP_90;
 						align_step_time = 0;
@@ -624,8 +628,8 @@ void FOC_Update(void)
 					foc.Vd = ALIGN_VOLTAGE;
 					foc.Vq = 0.0f;
 					foc.angle = PI / 2.0f;
-					if (align_step_time == 0) align_step_time = HAL_GetTick();
-					if (HAL_GetTick() - align_step_time > ALIGN_STEP_DELAY) {
+					if (align_step_time == 0) align_step_time = s_tick;
+					if (s_tick - align_step_time > ALIGN_STEP_DELAY) {
 						end_angle_raw = align_average_angle();     // 窗口平均，非单点
 						align_step = ALIGN_STEP_DONE;
 						align_step_time = 0;
@@ -692,10 +696,7 @@ void FOC_Update(void)
 			// ★ 角度源必须用"未滤波"的 KTH7823_Angle_Multiturn：
 			mechanical_angle = (KTH7823_Angle_Multiturn - encoder_offset) * encoder_direction;
 			// 电角度 = 机械角度 × 极对数
-			foc.angle = mechanical_angle * MOTOR_POLE_PAIRS;
-			// 归一化到 [0, 2π)
-			foc.angle = fmodf(foc.angle, 2.0f * PI);
-			if (foc.angle < 0.0f) foc.angle += 2.0f * PI;
+			foc.angle = FOC_NormAngle(mechanical_angle * MOTOR_POLE_PAIRS);
 			// Park变换（得到 Id, Iq）
 			FOC_Park();
 
@@ -742,18 +743,19 @@ void FOC_Update(void)
 				// 放在中断侧是为了让 foc.mode 的状态迁移只发生在单一上下文，避免与故障拦截互相覆盖。
 				foc.fault_recover_state = FOC_RECOVER_IDLE;
 				FOC_SetMode(FOC_STATE_OPENLOOP);
-				foc.last_recover_tick = HAL_GetTick();   // 记录恢复时刻，供稳定运行后重置计数
+				// 记录恢复时刻：此处刻意取"此刻"（HAL_GetTick）而非本拍快照 s_tick，
+				// 用途是与 16s 稳定窗口（FAULT_RETRY_DELAY_MAX）比较，1ms 误差无影响。
+				foc.last_recover_tick = HAL_GetTick();
 				Run_ON();
 				return;  // 本拍不调制，下一拍起按开环正常输出
 			}
 
 			if (foc.fault_recover_state == FOC_RECOVER_IDLE &&
-			    HAL_GetTick() >= foc.fault_recover_time) {
+			   s_tick >= foc.fault_recover_time) {
 				uint32_t recheck = 0;
 				// 恢复前需同时满足：温度正常 + 母线电压安全 + 转速已回落 + I²t 已回落（滞回防震荡）
 				if (fault_recover_blocked(&recheck)) {
-					UartLog_RecoverBlocked();   // [TEST] 记录"恢复被挡"判据（删除本模块时一并删除本行）
-					foc.fault_recover_time = HAL_GetTick() + recheck;
+					foc.fault_recover_time = s_tick + recheck;
 				} else {
 					// 只置握手状态：DRV8353_Recover() 内含 SPI 通信 + 多次 DWT_DelayMs 忙等，
 					// 累计阻塞约 20ms（= 20kHz 控制周期的 400 拍），绝不能在中断里执行；
@@ -774,16 +776,19 @@ void FOC_Update(void)
 	Protect_FOC();
 
 	// 电压限幅与归一化
-	float V_mag = sqrtf(foc.Vd * foc.Vd + foc.Vq * foc.Vq);
-	float V_max = bus_voltage / 1.732f;  // Vdc/√3：SVPWM 线性调制区上限（六边形内切圆）
-	if (V_mag > V_max) {
-		foc.Vd = foc.Vd / V_mag * V_max;
-		foc.Vq = foc.Vq / V_mag * V_max;	
+	float vbus = bus_voltage;
+	float V_max = vbus * 0.57735027f;          // Vdc/√3，无除法 
+	float inv_max = 1.0f / V_max;              // 全拍唯一一次 VDIV 
+	float vd_n = foc.Vd * inv_max;
+	float vq_n = foc.Vq * inv_max;
+	float mag2 = vd_n * vd_n + vq_n * vq_n;    // 用平方比较，常规路径不开方 
+	if (mag2 > 1.0f) {
+		float k = 1.0f / sqrtf(mag2);          // 仅越界时才 VSQRT+VDIV 
+		vd_n *= k;  vq_n *= k;
+		foc.Vd *= k; foc.Vq *= k;              // 诊断量保持与归一化一致 
 	}
-
-	// 归一化到 SVPWM 标幺值：满调制 r=1 对应 Vdc/√3，与上方限幅基准 V_max 一致
-	foc.Vd_norm = foc.Vd / V_max;
-	foc.Vq_norm = foc.Vq / V_max;
+	foc.Vd_norm = vd_n;
+	foc.Vq_norm = vq_n;
 
 	// 逆 Park 变换
 	FOC_InversePark();  
@@ -812,7 +817,6 @@ void FOC_FaultRecoverProcess(void)
 	// 温度/母线电压/转速/I²t 任一超限则作废请求，交回中断重新计时。
 	uint32_t recheck = 0;
 	if (fault_recover_blocked(&recheck)) {
-		UartLog_RecoverBlocked();   // [TEST] 记录"恢复被挡"判据（删除本模块时一并删除本行）
 		foc.fault_recover_state = FOC_RECOVER_IDLE;
 		foc.fault_recover_time  = HAL_GetTick() + recheck;
 		return;
@@ -940,7 +944,7 @@ void FOC_SetTargetTorque(float torque_Nm)
 // LED 状态机
 void LED_Update(void)
 {
-	uint32_t now = HAL_GetTick();
+	uint32_t now = s_tick;
 
 	// 上电自检 3 次失败：控制已锁死，200ms 相位强制定亮/定灭（每拍都写，不会被其它分支覆盖）
 	if (MotorControl_BootIsHwError()) {

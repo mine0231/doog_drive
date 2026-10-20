@@ -6,6 +6,8 @@
 #include "tim.h"
 #include "foc.h"
 #include "arm_math.h"
+#include "motor_control.h"
+
 
 // 过流保护
 extern volatile uint8_t fault_triggered;
@@ -26,6 +28,7 @@ static uint8_t  comm_armed = 0;         // 收到首帧后置 1，失联保护�
 
 // I²t 热积累量（全局，供 FOC.c 恢复分支判断是否仍过热）
 volatile float i2t_accum = 0.0f;
+volatile float i_mag2   = 0.0f;   // 三相合成电流幅值平方（供 I²t 累积用）
 
 // 软限位/位置误差阈值（减速器输出端位置，rad，此处定义默认值，MotorControl_Init 可覆盖）
 float soft_limit_min  = -3.14159f;  // 默认 -π（约 -180°）
@@ -42,11 +45,9 @@ void Protect_StopPWM(void)
 		fault_mask |= FAULT_MASK_BIT(fault_code);
 	}
 
-	// 软堵转/过流保护：三相合成电流超阈值则关驱动、停 PWM，并置 fault 标志
-    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
-    __HAL_TIM_ENABLE(&htim1);   // 补回 CEN，抵消 HAL_TIM_PWM_Stop 的副作用
+	// 直接写寄存器封锁三相输出：只清通道使能 + 清主输出使能，不碰 CEN
+    TIM1->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC3E);
+    TIM1->BDTR &= ~TIM_BDTR_MOE;
 }
 
 // 检测三相合成电流幅值，超阈值即停驱动并交状态机处理
@@ -54,12 +55,12 @@ void Protect_StopPWM(void)
 void Protect_StallCheck(void)
 {
     // 三相合成电流幅值（比单看一相更稳，能反映真实堵转/过流）
-    float i_mag = sqrtf(current_A * current_A +
-                         current_B * current_B +
-                         current_C * current_C);
+    i_mag2 = (current_A * current_A +
+              current_B * current_B +
+              current_C * current_C);
 
     // 堵转判定：大电流 且 转速接近 0（正常高速大电流运行不误触发）
-    if (i_mag > STALL_CURRENT_LIMIT &&
+    if (i_mag2 > STALL_CURRENT_LIMIT * STALL_CURRENT_LIMIT &&
         fabsf(KTH7823_Speed_Rads) < STALL_SPEED_THRESHOLD) {
         fault_code = FAULT_CODE_STALL;   // 锁存软件故障码（先于 Disable，供主循环上报）
         // 触发硬件保护：关闭栅极驱动 + 停三路 PWM
@@ -80,9 +81,9 @@ void Protect_EncoderStallCheck(void)
     // ---- 准备阶段：等主循环开始刷新编码器，再观察 ARM_DELAY 后才开始监测 ----
     if (!enc_armed) {
         if (encoder_update_count != 0) {                 // 编码器已在主循环内刷新
-            if (enc_arm_tick == 0) enc_arm_tick = HAL_GetTick();
-            else if (HAL_GetTick() - enc_arm_tick > ENCODER_ARM_DELAY_MS) {
-                enc_armed = 1;
+            if (enc_arm_tick == 0) enc_arm_tick = s_tick;  // 记录起始点
+            else if (s_tick - enc_arm_tick > ENCODER_ARM_DELAY_MS) {
+                enc_armed = 1;   // 过了延时，开始监测
             }
         } else {
             enc_arm_tick = 0;                            // 还没刷新，计时作废
@@ -275,9 +276,7 @@ void Protect_PhasePeakCheck(void)
 // 区分"短时峰值"（允许）与"持续过流"（保护）；恢复需热积累回落到复位阈值以下。
 void Protect_I2tCheck(void)
 {
-    float i_mag2 = current_A * current_A +
-                   current_B * current_B +
-                   current_C * current_C;
+
     float i_rms2 = i_mag2 / 3.0f;   // 单相等效 RMS 电流平方（i_mag = √3·I_rms）
     float nom2   = I2T_NOMINAL_CURRENT * I2T_NOMINAL_CURRENT;
 

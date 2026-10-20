@@ -60,6 +60,7 @@ volatile uint8_t  fault_code = FAULT_CODE_NONE;  // 故障诊断码（锁存）�
 volatile uint16_t fault_mask = 0;                // 本次故障事件内触发过的所有保护位（bit=FAULT_CODE_n），与 fault_code 同步清零
 volatile uint16_t fault_status1 = 0;             // 硬件故障 STATUS1 锁存（Disable 前读取）
 volatile uint16_t fault_status2 = 0;             // 硬件故障 STATUS2 锁存
+volatile uint8_t  fault_status_valid = 0;        // 1=上面两个值是本次 nFAULT 读到的；0=本次没读到（SPI 忙），值不可信
 
 /* USER CODE END PD */
 
@@ -82,16 +83,24 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim);
 // 驱动故障回调函数
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    if (GPIO_Pin == GPIO_PIN_12){
+    if (GPIO_Pin != GPIO_PIN_12) return;  // 仅处理 DRV8353 nFault 引脚
+
+    // 立即停输出（PWM 已在 Protect 里被 Disable/Stop，这里双重保险）
+    TIM1->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC3E);
+    TIM1->BDTR &= ~TIM_BDTR_MOE;
+
+    if(hspi2.State == HAL_SPI_STATE_READY) {
 			// 先锁存硬件故障详情（此时 EN 尚未拉低、SPI 可用，读到的才是真实故障位）
 			fault_status1 = DRV8353_ReadReg(DRV8353_REG_STATUS1);
 			fault_status2 = DRV8353_ReadReg(DRV8353_REG_STATUS2);
-			fault_code = FAULT_CODE_HARDWARE;
-			// 立即停止 PWM 输出
-			DRV8353_Disable();
-      Protect_StopPWM();
-			fault_triggered = 1;
-		} 
+			fault_status_valid = 1;
+		} else {
+      fault_status_valid = 0;
+    }
+
+    DRV8353_Disable();                        
+    fault_code = FAULT_CODE_HARDWARE;
+    fault_triggered = 1;
 }
 
 /* USER CODE END PFP */
@@ -166,9 +175,9 @@ int main(void)
 
 		// 调试监控快照：集中刷新关键运行变量到 dbg，供 KEIL Watch 观察
 //		DBG_Monitor_Update();
-
-		// [TEST] 故障/状态自动串口上报（删除本模块时一并删除本行）
-//		UartLog_Poll();
+		
+		// 温度更新
+		TempSense_Update();
 
 		// 故障监测：仅做诊断上报，真正的退避/恢复由 FOC_Update 顶部的FOC_STATE_FAULT 状态机接管
     // （fault_triggered 在此不清除，留给 FOC 消费）
@@ -199,45 +208,49 @@ int main(void)
       } else if (fault_code == FAULT_CODE_COMM_TIMEOUT) {
           UART_SendString("FAULT: COMM_TIMEOUT\r\n");// 上位机通讯失联（CAN 心跳超时）
       } else {
-      if (status1 & 0x0400) UART_SendString("FAULT: FAULT\r\n");// 故障状态，对应nFault
-      if (status1 & 0x0200) UART_SendString("FAULT: VDS_OCP\r\n");// VDS监视器过流
-      if (status1 & 0x0100) UART_SendString("FAULT: GDF\r\n");// 栅极驱动故障
-      if (status1 & 0x0080) UART_SendString("FAULT: UVLO\r\n");// 欠压锁定
-      if (status1 & 0x0040) UART_SendString("FAULT: OTSD\r\n");// 过温关断
-      if (status1 & 0x0020) UART_SendString("FAULT: VDS_HA\r\n");// A 相高侧VDS过流
-      if (status1 & 0x0010) UART_SendString("FAULT: VDS_LA\r\n");// A 相低侧VDS过流
-      if (status1 & 0x0008) UART_SendString("FAULT: VDS_HB\r\n");// B 相高侧VDS过流
-      if (status1 & 0x0004) UART_SendString("FAULT: VDS_LB\r\n");// B 相低侧VDS过流
-      if (status1 & 0x0002) UART_SendString("FAULT: VDS_HC\r\n");// C 相高侧VDS过流
-      if (status1 & 0x0001) UART_SendString("FAULT: VDS_LC\r\n");// C 相低侧VDS过流
+				if(!fault_status_valid){
+					UART_SendString("FAULT: HW (STATUS unavailable: SPI busy at nFAULT)\r\n");
+				} else {
+				if (status1 & 0x0400) UART_SendString("FAULT: FAULT\r\n");// 故障状态，对应nFault
+				if (status1 & 0x0200) UART_SendString("FAULT: VDS_OCP\r\n");// VDS监视器过流
+				if (status1 & 0x0100) UART_SendString("FAULT: GDF\r\n");// 栅极驱动故障
+				if (status1 & 0x0080) UART_SendString("FAULT: UVLO\r\n");// 欠压锁定
+				if (status1 & 0x0040) UART_SendString("FAULT: OTSD\r\n");// 过温关断
+				if (status1 & 0x0020) UART_SendString("FAULT: VDS_HA\r\n");// A 相高侧VDS过流
+				if (status1 & 0x0010) UART_SendString("FAULT: VDS_LA\r\n");// A 相低侧VDS过流
+				if (status1 & 0x0008) UART_SendString("FAULT: VDS_HB\r\n");// B 相高侧VDS过流
+				if (status1 & 0x0004) UART_SendString("FAULT: VDS_LB\r\n");// B 相低侧VDS过流
+				if (status1 & 0x0002) UART_SendString("FAULT: VDS_HC\r\n");// C 相高侧VDS过流
+				if (status1 & 0x0001) UART_SendString("FAULT: VDS_LC\r\n");// C 相低侧VDS过流
 
-      // STATUS2：逐相/子系统细分诊断（只读）
-      if (status2 & 0x0400) UART_SendString("FAULT: SA_OC\r\n");// A 相电流采样放大器（CSA）过流
-      if (status2 & 0x0200) UART_SendString("FAULT: SB_OC\r\n");// B 相 CSA 过流
-      if (status2 & 0x0100) UART_SendString("FAULT: SC_OC\r\n");// C 相 CSA 过流
-      if (status2 & 0x0080) UART_SendString("FAULT: OTW\r\n");// 过温警告
-      if (status2 & 0x0040) UART_SendString("FAULT: GDUV\r\n");// 电荷泵 VCP / VGLS 欠压故障
-      if (status2 & 0x0020) UART_SendString("FAULT: VGS_HA\r\n");// A 相高侧 MOSFET 栅源（VGS）驱动故障
-      if (status2 & 0x0010) UART_SendString("FAULT: VGS_LA\r\n");// A 相低侧 MOSFET VGS 驱动故障
-      if (status2 & 0x0008) UART_SendString("FAULT: VGS_HB\r\n");// B 相高侧 MOSFET VGS 驱动故障
-      if (status2 & 0x0004) UART_SendString("FAULT: VGS_LB\r\n");// B 相低侧 MOSFET VGS 驱动故障
-      if (status2 & 0x0002) UART_SendString("FAULT: VGS_HC\r\n");// C 相高侧 MOSFET VGS 驱动故障
-      if (status2 & 0x0001) UART_SendString("FAULT: VGS_LC\r\n");// C 相低侧 MOSFET VGS 驱动故障
-      }
+				// STATUS2：逐相/子系统细分诊断（只读）
+				if (status2 & 0x0400) UART_SendString("FAULT: SA_OC\r\n");// A 相电流采样放大器（CSA）过流
+				if (status2 & 0x0200) UART_SendString("FAULT: SB_OC\r\n");// B 相 CSA 过流
+				if (status2 & 0x0100) UART_SendString("FAULT: SC_OC\r\n");// C 相 CSA 过流
+				if (status2 & 0x0080) UART_SendString("FAULT: OTW\r\n");// 过温警告
+				if (status2 & 0x0040) UART_SendString("FAULT: GDUV\r\n");// 电荷泵 VCP / VGLS 欠压故障
+				if (status2 & 0x0020) UART_SendString("FAULT: VGS_HA\r\n");// A 相高侧 MOSFET 栅源（VGS）驱动故障
+				if (status2 & 0x0010) UART_SendString("FAULT: VGS_LA\r\n");// A 相低侧 MOSFET VGS 驱动故障
+				if (status2 & 0x0008) UART_SendString("FAULT: VGS_HB\r\n");// B 相高侧 MOSFET VGS 驱动故障
+				if (status2 & 0x0004) UART_SendString("FAULT: VGS_LB\r\n");// B 相低侧 MOSFET VGS 驱动故障
+				if (status2 & 0x0002) UART_SendString("FAULT: VGS_HC\r\n");// C 相高侧 MOSFET VGS 驱动故障
+				if (status2 & 0x0001) UART_SendString("FAULT: VGS_LC\r\n");// C 相低侧 MOSFET VGS 驱动故障
+				}
+			}	
       UART_PrintFaultMask(fault_mask, fault_code);
 
       fault_code = FAULT_CODE_NONE;   // 上报完成后清除锁存
       fault_mask = 0;                 // 掩码与故障码同步清零
 		}
-
+		
 		// 处理串口命令
     UART_Cmd_Process();
 
 		// 自动实时上报状态
-//		UART_SendStatus();
+		UART_SendStatus();
 		
-		// 对齐结果上报
-		UART_ReportAlignResult();
+		// 自检结果上报
+//		UART_ReportAlignResult();
 
 		// 非阻塞发送兜底：发送链路异常（HAL 启动失败/出错）时恢复，正常无开销
 		UART_Tx_Poll();
@@ -251,8 +264,8 @@ int main(void)
 		// 编码器刷新：主循环读角度 + 测速，20kHz 控制中断读到的最旧角度约 1ms
 		KTH7823_UpdateAngle();   // SPI 单帧流水线读角度 -> 异常读数统计 -> 解包裹/野值剔除 -> 滤波 -> 多圈角
 		KTH7823_UpdateSpeed();   // DWT 差分测速（一阶低通）
-		DWT_DelayMs(1);          // 定 1ms 节拍
-
+		DWT_DelayMs(1);          // 定 1ms 节拍 
+		
 		// 喂独立看门狗：主循环 1ms 周期喂狗，远小于 1s 超时
 		HAL_IWDG_Refresh(&hiwdg);
 		 

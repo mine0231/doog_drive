@@ -41,7 +41,10 @@ float PID_Calculate(PID_Handle_t *pid, float target, float feedback, float dt)
     float P_out = pid->params.Kp * error;
 
     // 微分项 (D)：微分先行（对 feedback 微分，避免设定值阶跃引起微分冲击）
-    float D_out = pid->params.Kd * (feedback - pid->prev_feedback) / dt;
+    float D_out = 0.0f;
+    if (pid->params.Kd != 0.0f) {
+        D_out = pid->params.Kd * (feedback - pid->prev_feedback) / dt;
+    }
     pid->prev_feedback = feedback;
 
     // 先更新积分（带积分限幅）

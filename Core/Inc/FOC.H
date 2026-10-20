@@ -72,6 +72,7 @@
 #define FOC_OL_DEG2RAD              0.01745329252f   // 度 -> rad（不依赖 PI 宏，避免头文件依赖差异）
 #define FOC_OL_RAD2DEG              57.29577951308f  // rad -> 度
 #define FOC_OL_TWO_PI               6.28318530718f   // 2π
+#define FOC_OL_INV_TWO_PI 					(1.0f / 6.28318530718f)
 
 // FOC状态机：枚举值即对外统一模式编号（0..6）
 typedef enum {
@@ -140,8 +141,8 @@ typedef struct {
     float pos_err_integral_acc;  // 位置误差持续超限的周期累计（保护用）
     // 故障退避（FOC_STATE_FAULT 期间使用，非阻塞倒计时）
     uint8_t  fault_retry_cnt;   // 连续故障次数（指数退避）
-    uint32_t fault_recover_time;// 计划恢复时间戳(ms)，由 HAL_GetTick() 比较
-    uint32_t last_recover_tick; // 最近一次故障恢复时刻(ms)，稳定运行超时后据此重置 fault_retry_cnt
+    uint32_t fault_recover_time;// 计划恢复时间戳(ms)，与 s_tick 比较
+    uint32_t last_recover_tick; // 最近一次故障恢复时刻(ms)，s_tick 差值超 FAULT_RETRY_DELAY_MAX 后重置 fault_retry_cnt
     uint8_t  fault_recover_state; // 故障恢复握手状态：FOC_RECOVER_IDLE/REQ/BUSY/DONE
                                   //   （中断侧跑 0→1 与 3→0，主循环只跑 1→2→3；见 FOC_FaultRecoverProcess）
 } FOC_State;
