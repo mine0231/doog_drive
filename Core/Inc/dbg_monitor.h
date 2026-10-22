@@ -62,10 +62,13 @@ typedef struct {
     uint8_t pin_nfault; // PA12 nFAULT（故障脚，低有效）：1=高(无故障) 0=低(有故障)
 
     /* ---- 计数 ---- */
-    uint32_t encoder_update_count;  // 编码器采样计数（主循环刷新时递增，作刷新心跳）
+    uint32_t encoder_update_count;  // 编码器采样心跳（控制中断内按 1kHz 递增）
     uint32_t control_tick;          // 控制节拍计数
     uint16_t kth_raw_fault_cnt;     // 连续异常读数（0x0000/0xFFFF）次数，正常读数清零
-    uint8_t  kth_raw_fault;         // 编码器断线标志：1=连续无效读数达阈值（判定失效）
+    uint8_t  kth_raw_fault;         // 连续无效 raw 达阈值诊断位
+    uint16_t kth_stale_ticks;       // 距最近一次有效编码器样本的 20kHz 控制周期数
+    uint8_t  kth_stale;             // 编码器样本过期标志
+    uint16_t kth_spi_err_cnt;       // SPI 帧失败累计数
 } DBG_Monitor_t;
 
 extern volatile DBG_Monitor_t dbg;   // 监控快照实例（定义于 FOC.c）

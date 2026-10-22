@@ -1,4 +1,4 @@
-drive/kth7823.o: ..\Core\Src\KTH7823.c ..\Core\Inc\kth7823.h \
+drive/kth7823.o: ..\Core\Src\kth7823.c ..\Core\Inc\kth7823.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal.h \
   ..\Core\Inc\stm32g4xx_hal_conf.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_rcc.h \

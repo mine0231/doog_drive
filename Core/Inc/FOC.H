@@ -61,7 +61,7 @@
 
 // 开环"转到指定输出端角度 + 到位悬停保持"参数
 #define GEAR_RATIO_OUT2MOTOR        12.5f   // 减速器输出端 -> 电机轴 的减速比
-#define FOC_OL_DEFAULT_SPEED        5.0f    // 未设转速时的默认开环转速 (rad/s，电机轴)
+#define FOC_OL_DEFAULT_SPEED        8.0f    // 未设转速时的默认开环转速 (rad/s，电机轴)
 #define FOC_OL_DEFAULT_VOLTAGE      0.6f    // 未设电压时的默认开环电压 (V)
 #define FOC_OL_MOVE_TIMEOUT_MS      5000    // 运动阶段超时 (ms)：未转够则直接断电释放
 #define FOC_OL_HOLD_VOLTAGE_MAX     0.6f    // 悬停/回拉电压上限 (V)：d 轴持续通电，越大保持力矩越强、发热越大

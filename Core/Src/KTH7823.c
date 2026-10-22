@@ -4,57 +4,53 @@
 #include "spi.h"
 #include "dwt_delay.h"   // DWT_DelayMs
 
+extern float control_dt;   // 控制周期 (s)，motor_control.c 定义
 
 // 全局变量
-volatile float KTH7823_Angle_Rad = 0.0f;	// 单圈角度 [0, 2π)
+volatile float KTH7823_Angle_Rad = 0.0f;	// 单圈角度 [0, 2π)（慢路径，滤波后）
 float KTH7823_Angle_Deg        = 0.0f;	// 当前角度（度）
-float KTH7823_Angle_Multiturn  = 0.0f;	// 多圈总角度（连续无界，弧度）
-float KTH7823_Speed_RPM        = 0.0f;	// 当前速度（RPM）
+volatile float KTH7823_Angle_Multiturn  = 0.0f;	// 多圈总角度（连续无界，弧度，未滤波）
+volatile float KTH7823_Angle_Multiturn_Comp = 0.0f;	// 一拍延迟补偿后的多圈角度（闭环角度源）
+volatile float KTH7823_Speed_RPM        = 0.0f;	// 当前速度（RPM）
 volatile float KTH7823_Speed_Rads = 0.0f;	// 当前速度（rad/s）
 
-// 刷新心跳计数器：每次 KTH7823_UpdateAngle 调用 +1，供失速/断线监测判断编码器是否在刷新
+// 刷新心跳计数器：慢路径(1kHz)每拍 +1，供失速/断线监测判断编码器是否在刷新
 volatile uint32_t encoder_update_count = 0;
 
-// 连续异常读数（0x0000/0xFFFF）计数：正常读数清零，供 Protect_EncoderStallCheck 判定读数有效性
+// 连续异常读数（0x0000/0xFFFF）计数：正常 raw 清零，诊断用
 volatile uint16_t kth7823_raw_fault_cnt = 0;
+
+// 距离最近一次接受有效角度样本的控制周期数；通信/raw/解包裹异常均不刷新
+volatile uint16_t kth7823_stale_ticks = 0;
 
 // 被丢弃的解包裹野值累计次数（诊断用，只增不清零；正常应保持 0 或偶发）
 volatile uint16_t kth7823_unwrap_glitch_cnt = 0;
 
-// 滤波变量
+// SPI 帧失败（超时 / 重入被拒）累计次数（诊断用）
+volatile uint16_t kth7823_spi_err_cnt = 0;
+
+// 失败帧的现场快照（[TEMP] 诊断用：确认是 SPE 未开、TXE 不置位还是 RXNE 不来）
+volatile uint32_t kth7823_diag_cr1 = 0;
+volatile uint32_t kth7823_diag_sr  = 0;
+
+// 滤波变量（慢路径 1kHz）
 static float filtered_cos = 1.0f;
 static float filtered_sin = 0.0f;
 static uint8_t filter_initialized = 0;
-static uint16_t last_raw_angle = 0;
+
+// 解包裹状态（快路径 20kHz）
+static volatile uint16_t last_raw_angle = 0;   // 中断写、主循环读（16 位原子）
 static uint8_t  raw_initialized = 0;
-static float    angle_unwrapped = 0.0f;  // 连续单圈角度
-static float    last_unwrapped_angle = 0.0f;  // 上一帧连续角度（供速度差分，Init 时复位）
-static uint32_t last_speed_tick = 0;     // 上次 UpdateSpeed 的 DWT->CYCCNT 时间戳（周期数，Init 时复位）
+static float    angle_unwrapped = 0.0f;      // 连续单圈角度（解包裹后）
+static float    angle_prev_valid = 0.0f;     // 上一有效帧的多圈角（供一拍差分算 ω）
+static uint32_t last_valid_cyc = 0;          // 上一有效帧的 DWT 时间戳
 
-// SPI 收发一帧 16bit（uint16_t 单帧 + Size=1，避免 16 位模式下字节序/越界问题）
-static uint16_t spi_exchange_frame(uint16_t tx)
-{
-    // 初始化为0
-    uint16_t txw = tx;   // 直接 16 位，硬件 MSB 先发，无字节序问题
-    uint16_t rxw = 0;
+// 测速状态（慢路径 1kHz）
+static float    last_unwrapped_angle = 0.0f;
+static uint32_t last_speed_tick = 0;
 
-    HAL_GPIO_WritePin(ME_CS_GPIO_Port, ME_CS_Pin, GPIO_PIN_RESET);
-    HAL_SPI_TransmitReceive(KTH7823_SPI, (uint8_t *)&txw, (uint8_t *)&rxw, 1, 100);
-    HAL_GPIO_WritePin(ME_CS_GPIO_Port, ME_CS_Pin, GPIO_PIN_SET);
-
-    return rxw;   // HAL 16 位模式已写入完整 16 位
-}
-
-// 读取 KTH7823 原始角度值（16位）—— 单帧流水线读取
-// 协议：当前帧发送命令，返回的是“上一命令帧的回读”。每拍都发同一个读命令（0x0000），
-//       故本帧的返回值就是上一拍命令对应的角度，等价于旧版“发两帧取第二帧”，但线时减半
-//       （1 帧 16bit @9MHz ≈ 1.78µs，旧版 2 帧 ≈ 3.56µs），仅滞后一帧。
-// CS：每帧独立“拉低→传输→拉高”，两帧之间高电平远大于 50ns 的要求（HAL 调用开销已足够）。
-// 注：流水线第一拍由 KTH7823_Init() 的那次调用建立，其返回值（上电旧值）被丢弃。
-uint16_t KTH7823_ReadAngleRaw(void)
-{
-    return spi_exchange_frame(0x0000); // 发读命令并直接取回读（= 上一命令帧对应的角度）
-}
+// 帧重入保护：SPI1 只允许一个调用者，异常重入直接丢弃（绝不并发拉 CS）
+static volatile uint8_t spi_in_frame = 0;
 
 // 角度弧度转换
 static float raw_to_rad(uint16_t raw)
@@ -62,64 +58,144 @@ static float raw_to_rad(uint16_t raw)
     return (float)raw / KTH7823_ANGLE_RESOLUTION * 2.0f * PI;  // 65536 个刻度覆盖 2π
 }
 
-// KTH7823 初始化
-void KTH7823_Init(void)
+/* SPI 收发一帧 16bit（16 位数据帧，单字）
+ * CS 规则：每帧独立"拉低 → 传输 → 拉高"，任何返回路径都先恢复高电平；
+ *          绝不连续拉低 CS 读多帧（硬件要求帧间高电平 ≥50ns）。
+ * 为什么不用 HAL_SPI_TransmitReceive：它在中断里用 HAL_GetTick() 计超时，
+ * 而 SysTick 优先级 15 无法抢占 TIM1（优先级 1），一旦卡住就永不返回，
+ * 会把 PWM 冻结在最后占空比直到看门狗复位。这里改为寄存器级 + DWT 限时。
+ * 返回 1 = 成功；0 = 超时/重入被拒（调用方按"本拍无新角度"处理）。 */
+static uint8_t spi_exchange_frame(uint16_t tx, uint16_t *rx)
 {
-    KTH7823_Angle_Rad = 0.0f;
-    KTH7823_Angle_Deg = 0.0f;
-    KTH7823_Angle_Multiturn = 0.0f;
-    KTH7823_Speed_Rads = 0.0f;
-    KTH7823_Speed_RPM = 0.0f;
+    SPI_TypeDef *spi = KTH7823_SPI->Instance;
+    uint32_t t0    = DWT->CYCCNT;
+    uint32_t limit = SystemCoreClock / (1000000u / KTH7823_SPI_TIMEOUT_US);  // µs → cycles
+    uint16_t rxw   = 0;
+    uint8_t  ok    = 1;
 
-    filtered_cos = 1.0f;
-    filtered_sin = 0.0f;
-    filter_initialized = 0;
-    raw_initialized = 0;
-    angle_unwrapped = 0.0f;
-    last_unwrapped_angle = 0.0f;  // 复位速度差分基准，避免重新 Init 后首帧速度跳变
-    last_speed_tick = 0;          // 复位速度计时基准，首帧 UpdateSpeed 不计算速度
-    kth7823_raw_fault_cnt = 0;    // 复位异常读数计数
-    kth7823_unwrap_glitch_cnt = 0; // 复位野值剔除计数
-    encoder_update_count = 0;
+    if (spi_in_frame != 0u) {          // 重入（不应发生）：丢弃，避免并发拉低 CS
+        return 0;
+    }
+    spi_in_frame = 1;
 
-    // 建立流水线首拍：单帧协议下这一帧既完成上电通信初始化，也让下一帧能取到有效回读。
-    // 其返回值是上电旧值/无效值，直接丢弃（首次 UpdateAngle 取到的才是本条命令对应的角度）。
-    KTH7823_ReadAngleRaw();
-    DWT_DelayMs(10);
+    spi->CR1 |= SPI_CR1_SPE;                            // 确保外设使能（幂等）
+    HAL_GPIO_WritePin(ME_CS_GPIO_Port, ME_CS_Pin, GPIO_PIN_RESET);
+
+    while ((spi->SR & SPI_SR_TXE) == 0u) {              // 等 TX FIFO 有空位
+        if ((DWT->CYCCNT - t0) > limit) { ok = 0; break; }
+    }
+    if (ok) {
+        // 必须用 32 位访问：DS=16bit 时 DR 仍是 32 位寄存器（HAL 也是整字写），
+        // 半字写不会触发传输，会表现为 RXNE 永不置位 → 每帧白等一个超时。
+        spi->DR = (uint32_t)tx;                         // 16 位帧，硬件 MSB 先发
+        while ((spi->SR & SPI_SR_RXNE) == 0u) {         // 等整帧收完
+            if ((DWT->CYCCNT - t0) > limit) { ok = 0; break; }
+        }
+    }
+    if (ok) {
+        rxw = (uint16_t)spi->DR;
+        uint32_t t1 = DWT->CYCCNT;
+        uint32_t bsy_limit = SystemCoreClock / 1000000u;   // 1µs：等最后一位移出，非致命
+        while ((spi->SR & SPI_SR_BSY) != 0u) {
+            if ((DWT->CYCCNT - t1) > bsy_limit) break;
+        }
+    }
+
+    HAL_GPIO_WritePin(ME_CS_GPIO_Port, ME_CS_Pin, GPIO_PIN_SET);   // 任何分支都先拉高
+
+    if (!ok) {   // 恢复：先读 DR/SR 清 OVR，再关-开 SPE 复位 FIFO，避免坏帧卡死后续所有帧
+        kth7823_diag_cr1 = spi->CR1;
+        kth7823_diag_sr  = spi->SR;
+        (void)spi->DR;
+        (void)spi->SR;
+        spi->CR1 &= ~SPI_CR1_SPE;
+        spi->CR1 |= SPI_CR1_SPE;
+    }
+
+    spi_in_frame = 0;
+
+    if (!ok) {
+        return 0;
+    }
+    *rx = rxw;
+    return 1;
 }
 
-// 更新当前角度
-void KTH7823_UpdateAngle(void)
+/* 20kHz 快路径：读 1 帧 → 无效判定 → 解包裹 → 更新多圈角与延迟补偿角。
+ * 不做 sin/cos/atan2（那是慢路径的事），单拍开销约 3~4µs。 */
+static void kth_sample_fast(void)
 {
-    uint16_t raw = KTH7823_ReadAngleRaw();
-		float raw_rad = raw_to_rad(raw);
+    uint16_t raw;
+
+    if (kth7823_stale_ticks < 0xFFFFu) kth7823_stale_ticks++;
+
+    if (!spi_exchange_frame(0x0000u, &raw)) {
+        if (kth7823_spi_err_cnt < 0xFFFFu) kth7823_spi_err_cnt++;
+        return;                                        // 本拍无新角度，保留上次值
+    }
 
     // 异常读数统计：0x0000/0xFFFF 视为断线/无磁等无效读数，连续累加；正常读数清零
     if (raw == 0x0000u || raw == 0xFFFFu) {
         if (kth7823_raw_fault_cnt < 0xFFFFu) kth7823_raw_fault_cnt++;
-    } else {
-        kth7823_raw_fault_cnt = 0;
+        return;                                        // 无效值不参与解包裹
     }
-	
-    // 多圈解包裹：用 16 位带符号差值累积
-    if (!raw_initialized) {
-        last_raw_angle = raw;
-        angle_unwrapped = raw_rad;
-        raw_initialized = 1;
-    } else {
-        int16_t delta_raw = (int16_t)(raw - last_raw_angle);  // 自动处理跨 0xFFFF 边界
-        // 野值剔除：单次刷新内跳变超物理可能上限（见 KTH7823_UNWRAP_MAX_DELTA），判为坏读数/
-        // 解包裹野值，丢弃本次——不更新 last_raw_angle、不累积角度，等下一次好读数再接续，
-        // 从而避免多圈角度阶跃与测速尖峰（后者会误触发超速保护）。
-        if (delta_raw > KTH7823_UNWRAP_MAX_DELTA || delta_raw < -KTH7823_UNWRAP_MAX_DELTA) {
-            if (kth7823_unwrap_glitch_cnt < 0xFFFFu) kth7823_unwrap_glitch_cnt++;
-        } else {
-            last_raw_angle = raw;
-            angle_unwrapped += (float)delta_raw / KTH7823_ANGLE_RESOLUTION * 2.0f * PI;
-        }
+    kth7823_raw_fault_cnt = 0;
+
+    if (!raw_initialized) {                            // 首帧建基准
+        last_raw_angle  = raw;
+        angle_unwrapped = raw_to_rad(raw);
+        angle_prev_valid = angle_unwrapped;
+        last_valid_cyc   = DWT->CYCCNT;
+        raw_initialized  = 1;
+        kth7823_stale_ticks = 0;
+        KTH7823_Angle_Multiturn      = angle_unwrapped;
+        KTH7823_Angle_Multiturn_Comp = angle_unwrapped;
+        return;
     }
 
-    // sin/cos 一阶低通滤波
+    // 多圈解包裹：用 16 位带符号差值累积
+    int16_t delta_raw = (int16_t)(raw - last_raw_angle);   // 自动处理跨 0xFFFF 边界
+    // 野值剔除：单帧跳变超物理可能上限，判为坏读数/解包裹野值，丢弃本次——
+    // 不更新 last_raw_angle、不累积角度，等下一次好读数再接续，避免多圈角阶跃与测速尖峰
+    if (delta_raw > KTH7823_UNWRAP_MAX_DELTA || delta_raw < -KTH7823_UNWRAP_MAX_DELTA) {
+        if (kth7823_unwrap_glitch_cnt < 0xFFFFu) kth7823_unwrap_glitch_cnt++;
+        return;
+    }
+
+    last_raw_angle = raw;
+    angle_unwrapped += (float)delta_raw / KTH7823_ANGLE_RESOLUTION * 2.0f * PI;
+
+    // 一拍延迟补偿：用相邻两个"有效帧"的 DWT 间隔算角速度（不做低通）。
+    // 1 count 量化 = 1.92 rad/s（50µs），折算到补偿量 <0.01° 电角度，可忽略。
+    uint32_t now = DWT->CYCCNT;
+    float dt = (float)(now - last_valid_cyc) / (float)SystemCoreClock;
+    if (dt > 0.0f) {
+        float omega = (angle_unwrapped - angle_prev_valid) / dt;
+        // 限幅：坏帧/抖动时避免补偿项飞掉（±400 rad/s 远高于 230 rad/s 超速阈值）
+        if (omega >  400.0f) omega =  400.0f;
+        if (omega < -400.0f) omega = -400.0f;
+        KTH7823_Angle_Multiturn_Comp = angle_unwrapped
+                                     + omega * (KTH7823_ANGLE_DELAY_PERIODS * control_dt);
+    } else {
+        KTH7823_Angle_Multiturn_Comp = angle_unwrapped;
+    }
+    angle_prev_valid = angle_unwrapped;
+    last_valid_cyc   = now;
+
+    KTH7823_Angle_Multiturn = angle_unwrapped;   // 未补偿值（上报/对齐/开环用）
+    kth7823_stale_ticks = 0;
+}
+
+/* 1kHz 慢路径：用最近一次有效 raw 做 sin/cos 低通 + atan2（不读 SPI）。
+ * α 按 1kHz 定义，与改造前语义一致，开环/对齐/上报行为不变。 */
+static void kth_update_filtered_angle(void)
+{
+    if (!raw_initialized) {
+        return;                                      // 还没有有效读数
+    }
+
+    float raw_rad = raw_to_rad(last_raw_angle);
+
     if (!filter_initialized) {
         filtered_cos = cosf(raw_rad);
         filtered_sin = sinf(raw_rad);
@@ -135,26 +211,15 @@ void KTH7823_UpdateAngle(void)
         }
     }
 
-    // 输出：单圈角度
     float filtered_angle = atan2f(filtered_sin, filtered_cos);
     if (filtered_angle < 0.0f) filtered_angle += 2.0f * PI;
 
     KTH7823_Angle_Rad = filtered_angle;
     KTH7823_Angle_Deg = filtered_angle * 180.0f / PI;
-
-    // 输出：多圈总角度
-    KTH7823_Angle_Multiturn = angle_unwrapped;
-
-    // 采样心跳计数（主循环每拍递增），供 Protect 判断编码器是否在刷新
-    encoder_update_count++;
 }
 
-/**
- * @brief 更新速度（通过角度差分计算）
- * @note  dt 用 DWT->CYCCNT @72MHz 测量（13.9ns 分辨率），取代 HAL_GetTick 的 1ms
- *        量化，避免 E[Δθ/Δt] 系统性偏高（实测约 +5%~10%）
- */
-void KTH7823_UpdateSpeed(void)
+/* 1kHz 慢路径：DWT 差分测速（窗口 ≈1ms，避免 20kHz 逐拍差分带来的量化噪声） */
+static void kth_update_speed(void)
 {
     uint32_t now = DWT->CYCCNT;
 
@@ -167,7 +232,7 @@ void KTH7823_UpdateSpeed(void)
     }
 
     uint32_t elapsed = now - last_speed_tick;
-    if (elapsed == 0) return;                                  // 同周期重复调用，跳过（而非钳到 1e-6）
+    if (elapsed == 0) return;                                  // 同周期重复调用，跳过
 
     float dt = (float)elapsed / (float)SystemCoreClock;        // 秒
 
@@ -183,6 +248,59 @@ void KTH7823_UpdateSpeed(void)
     last_speed_tick = now;
 }
 
-/* 编码器刷新入口已收敛到主循环：main.c 的 while(1) 每轮依次调用
- * KTH7823_UpdateAngle() + KTH7823_UpdateSpeed()，并 DWT_DelayMs(1) 定 1ms 节拍。
- * 阻塞式测试命令（串口 ang=）内部也需自行调用这两个函数，见 uart_cmd.c。 */
+// KTH7823 初始化
+void KTH7823_Init(void)
+{
+    KTH7823_Angle_Rad = 0.0f;
+    KTH7823_Angle_Deg = 0.0f;
+    KTH7823_Angle_Multiturn = 0.0f;
+    KTH7823_Angle_Multiturn_Comp = 0.0f;
+    KTH7823_Speed_Rads = 0.0f;
+    KTH7823_Speed_RPM = 0.0f;
+
+    filtered_cos = 1.0f;
+    filtered_sin = 0.0f;
+    filter_initialized = 0;
+    raw_initialized = 0;
+    angle_unwrapped = 0.0f;
+    angle_prev_valid = 0.0f;
+    last_valid_cyc = 0;
+    last_unwrapped_angle = 0.0f;
+    last_speed_tick = 0;
+    spi_in_frame = 0;
+
+    kth7823_raw_fault_cnt = 0;
+    kth7823_stale_ticks = 0;
+    kth7823_unwrap_glitch_cnt = 0;
+    kth7823_spi_err_cnt = 0;
+    encoder_update_count = 0;
+
+    // 建立流水线首拍：单帧协议下这一帧既完成上电通信初始化，也让下一帧能取到有效回读。
+    // 其返回值是上电旧值/无效值，直接丢弃（首个 Tick 取到的才是该命令对应的角度）。
+    uint16_t dummy;
+    (void)spi_exchange_frame(0x0000u, &dummy);
+    DWT_DelayMs(10);
+}
+
+/* 编码器刷新入口：唯一由 TIM1 20kHz 更新中断调用（SPI1 单一所有者）。
+ *   - 每拍：快路径 raw + 解包裹（闭环角度源）
+ *   - 每 20 拍（1kHz）：测速 + 心跳计数（便宜，且阻塞命令期间也必须保持更新）
+ * 滤波角度（cos/sin/atan2）不在这里做——实测约 7µs，会顶穿 20kHz 中断预算，
+ * 放到主循环的 KTH7823_SlowUpdate() 里按 1kHz 跑。 */
+void KTH7823_Tick(uint32_t tick)
+{
+    kth_sample_fast();
+
+    if ((tick % KTH7823_SLOW_DIV) == 0u) {
+        kth_update_speed();
+        encoder_update_count++;      // 心跳按 1kHz 递增，语义与改造前一致
+    }
+}
+
+/* 慢路径：滤波角度（sin/cos 低通 + atan2），由主循环按 ≈1kHz 调用。
+ * 只读中断缓存的 raw（16 位原子），不碰 SPI，因此不会与中断抢总线。
+ * α 语义与改造前一致（按 1kHz 调用定义），开环起始角/对齐平均/上报行为不变。 */
+void KTH7823_SlowUpdate(void)
+{
+    kth_update_filtered_angle();
+}

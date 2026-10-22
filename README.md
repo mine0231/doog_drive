@@ -15,7 +15,7 @@
 
 | 功能 | 说明 |
 |---|---|
-| **FOC 矢量控制** | Clark / Park 变换 + 七段式 SVPWM，电流环 **20kHz**（TIM1 更新中断，双采样双更新，`control_dt = 50µs`） |
+| **FOC 矢量控制** | Clark / Park 变换 + 七段式 SVPWM，电流环 **20kHz**（TIM1 更新中断，RCR=1 单采样单更新，`control_dt = 50µs`） |
 | **多模式运行** | IDLE / 开环 / 闭环速度 / 闭环位置 / 转矩 / **对齐**（两步磁力定位，由指令触发，自动求零点偏移与方向；**上电不再自动对齐**） |
 | **闭环级联** | 位置环 → 速度环 → 电流环（d/q 双轴）三级级联，位置式 PID（微分先行 + clamping 抗积分饱和） |
 | **开环「转角度 + 悬停」** | 按开环方式转到减速器输出端指定角度，到位后进入"电弹簧"悬停保持（`RUN → HOLD → PULL` 子状态机） |
@@ -24,7 +24,8 @@
 | **串口调试** | USART3 @ **115200**，命令行支持在线查看状态、修改模式 / 速度 / 电压 / 转矩、在线调 PID、CAN 诊断、故障读取 |
 | **软件保护** | 堵转、编码器失效、通讯失联、过温、母线过压 / 欠压、超速、相电流峰值、I²t 热积累、位置跟随误差、软限位共 11 项，另有 DRV8353 硬件故障（nFAULT） |
 | **故障恢复** | 指数退避（2s→4s→8s→16s 封顶）+ 条件复检，自动重启回到开环；阻塞式驱动恢复放在主循环执行 |
-| **可观测性** | `DBG_Monitor_t dbg` 调试快照（Keil Watch 一次展开看全部状态）、编码器采样心跳、CAN 运行统计 |
+| **编码器同拍采样** | KTH7823 在 **TIM1 20kHz 中断内**每拍读 1 帧 SPI（16bit ≈1.78µs），多圈解包裹后按实测角速度外推补偿 1 拍延迟；1kHz 慢路径（sin/cos 低通 + atan2，≈7µs）留在主循环，**SPI1 单一所有者** |
+| **可观测性** | `DBG_Monitor_t dbg` 调试快照（**主循环每轮 `DBG_Monitor_Update()` 刷新**，Keil Watch 展开 `dbg` 即可看全部状态）、编码器采样心跳、SPI 帧失败计数、CAN 运行统计 |
 
 > 注：`FOC.H` 中 `FOC_CLOSEDLOOP_ENABLE = 0`，当前固件处于**硬件验证/开环调试阶段**，闭环代码已就绪但默认未启用。
 
@@ -34,17 +35,18 @@
 |---|---|
 | **MCU** | STM32G474RBT6（LQFP64，Cortex-M4F，128KB Flash / 128KB RAM） |
 | **系统时钟** | HSE 8MHz → PLL → **SYSCLK 72MHz**；HCLK 72M / PCLK1 72M / PCLK2 36M |
-| **TIM1** | 三相 PWM，中心对齐模式1，PSC=0 / ARR=3599 → **10kHz PWM**、**20kHz 更新中断**，CH1/2/3（PA8/PA9/PA10），死区 0（由 DRV8353 内部 50ns 死区承担），TRGO=UPDATE（供 ADC 触发） |
-| **ADC1** | 12 位扫描 4 通道，`T1_TRGO` 上升沿触发，DMA 循环：CH2(PA1)=A 相电流、CH3(PA2)=B 相电流、CH8(PC2)=母线电压、CH4(PA3)=MOS 温度 |
-| **ADC2** | 12 位单通道 CH12(PB2)，同 `T1_TRGO` 触发：线圈 NTC 温度 |
-| **DMA1** | Ch1/Ch2 = ADC1/ADC2 循环搬运；Ch3 = USART3_TX、Ch4 = USART3_RX（循环） |
+| **TIM1** | 三相 PWM，中心对齐模式1，PSC=0 / ARR=1799 / **RCR=1** → **20kHz PWM**、**20kHz 更新中断**（更新事件落在下溢/谷点），CH1/2/3（PA8/PA9/PA10），死区 0（由 DRV8353 内部 50ns 死区承担），TRGO=UPDATE（供 ADC1 规则组 / ADC2 触发）；CH4 无引脚输出，仅作电流采样触发（`CCR4=288`，UEV 前 4µs） |
+| **ADC1 规则组** | 12 位 2 通道扫描，`T1_TRGO`(UEV) 上升沿触发，DMA 循环 2 半字：CH4(PA3)=MOS 温度（24.5cyc）、CH8(PC2)=母线电压（**247.5cyc**，经 100k 串阻需长采样）；整组耗时 8.25µs |
+| **ADC1 注入组** | 12 位 2 通道，`T1_CC4` 上升沿触发（TIM1_CH4 比较事件，**UEV 前 4µs**）：CH2(PA1)=A 相电流、CH3(PA2)=B 相电流；转换 2.06µs，更新中断内直接读 JDR1/JDR2（当拍值） |
+| **ADC2** | 12 位单通道 CH12(PB2)，`T1_TRGO`(UEV) 触发，DMA 循环 1 半字：线圈 NTC 温度；启动后**关闭 DMA 的 TC/HT/TE 中断**（搬运继续，省 40k 次/秒中断） |
+| **DMA1** | Ch1 = ADC1 规则组（2 半字/拍，循环）、Ch2 = ADC2（1 半字/拍，循环）；Ch3 = USART3_TX（**普通模式，非循环**）、Ch4 = USART3_RX（循环 + IDLE） |
 | **SPI1** | 主，16bit，CPOL=High，预分频 4 → **9 Mbit/s**：**KTH7823 磁编码器**（CS = `ME_CS` PC4） |
 | **SPI2** | 主，16bit，CPOL=Low，预分频 32 → **2.25 Mbit/s**：**DRV8353 栅极驱动**（CS = `DRV_CS` PC6） |
 | **SPI3** | 主，16bit，CPOL=High，预分频 32 → **2.25 Mbit/s**：**第二编码器**（减速器输出端，CS = `ME2_CS` PB0） |
 | **FDCAN2** | 经典帧 / 正常模式，Prescaler=9、TS1=5、TS2=2、SJW=1 → **1 Mbps**（采样点 75%），PB5(RX)/PB6(TX) |
 | **USART3** | **115200-8N1**，PB10(TX)/PB11(RX)，RX DMA 循环 + IDLE 空闲中断收帧 |
 | **IWDG** | 独立看门狗，预分频 256、Reload=125 → 超时 **约 1s**（主循环 1ms 周期喂狗） |
-| **GPIO / EXTI** | `ENABLE`(PA11，DRV8353 使能，低有效默认关)、`nFAULT`(PA12，下降沿 EXTI，优先级最高 0)、`LED`(PB9，低点亮)、`PWM_COTR`(PB12，DRV8353 PWM 控制脚)、三个片选 |
+| **GPIO / EXTI** | `ENABLE`(PA11，DRV8353 使能，**高电平使能 / 拉低进睡眠，上电默认低**)、`nFAULT`(PA12，下降沿 EXTI，优先级最高 0)、`LED`(PB9，低点亮)、`PWM_COTR`(PB12，DRV8353 PWM 控制脚，初始化期间保持低)、三个片选（ME_CS/DRV_CS/ME2_CS，推挽，空闲高） |
 | **中断优先级** | EXTI15_10 = 0 > TIM1(20kHz) = 1 > DMA/FDCAN/USART3 = 3 |
 | **延时** | `dwt_delay.c` 基于内核 DWT CYCCNT 的 µs/ms 精确延时（替代 `HAL_Delay`） |
 
@@ -53,9 +55,9 @@
 | 器件 | 型号 | 作用与关键参数 |
 |---|---|---|
 | 栅极驱动 | **DRV8353F**（SPI 版） | 3x PWM 模式、过流关断全部半桥；TDRIVE 1000ns，灌电流>拉电流抗直通；OCP 死区 50ns / 锁存模式 / 1.0V VDS 阈值；**内部 CSA 禁用**（改用外部 INA240）；软件可读回自检（`DRV8353_SelfCheck`） |
-| 电流采样 | **INA240A1** ×2 | A/B 相各一路，增益 20，采样电阻 1mΩ，VREF 偏置 1.65V（3.3V/2），理论上量程约 ±82A；C 相由基尔霍夫合成；上电 64 次平均求零偏 |
-| 磁编码器 | **KTH7823** | 电机轴角度，SPI1 **单帧流水线**读取（发 1 帧命令，返回上一命令帧的回读；1 帧 ≈1.78µs @9MHz），**16 位**分辨率（65536 刻度/圈），sin/cos 一阶低通 + atan2 + 多圈解包裹；连续读到 0x0000/0xFFFF 达 8 次判失效；刷新在主循环（≈1kHz），不占用定时器 |
-| 第二编码器 | **待定**（`encoder2.c` 为框架 + TODO 占位） | 减速器输出端角度，SPI3，作为位置环角度源 |
+| 电流采样 | **INA240A1** ×2 | A/B 相各一路，增益 20，采样电阻 1mΩ，VREF 偏置 1.65V（3.3V/2），理论上量程约 ±82A（`I_K≈0.04029 A/count`）；C 相由基尔霍夫合成；经 ADC1 注入组采样，触发点比控制更新早 4µs，控制中断取当拍值；上电 64 次平均求零偏 |
+| 磁编码器 | **KTH7823** | 电机轴角度，SPI1 **单帧流水线**读取（发 1 帧命令，返回上一命令帧的回读；1 帧 ≈1.78µs @9MHz），**16 位**分辨率（65536 刻度/圈）。**快路径在 TIM1 20kHz 中断内**（`KTH7823_Tick`）：每拍 1 帧 raw + 多圈解包裹，并用相邻有效帧的 DWT 间隔外推 1 拍延迟补偿（`KTH7823_Angle_Multiturn_Comp`，闭环角度源）；**慢路径在主循环 ≈1kHz**（`KTH7823_SlowUpdate`）：取中断缓存的 raw 做 sin/cos 一阶低通 + atan2（≈7µs，不碰 SPI）。SPI 为寄存器级收发 + DWT 限时（10µs）；SPI 失败、无效 raw 或野值导致 100 个控制周期（≈5ms）无有效角度样本时触发保护，故障恢复前要求样本重新有效 |
+| 第二编码器 | **待定**（`kth7823_2.c/.h`，`Encoder2_*` 为框架 + TODO 占位） | 减速器输出端角度，SPI3。仅上电时 `Encoder2_Init()` 调用一次，`Encoder2_UpdateAngle/UpdateSpeed` **无调用点**（输出端角度仍由电机轴多圈角 ÷12.5 推算） |
 | 功率 MOSFET | 见 `数据手册/MOSFET.pdf` | 驱动设计按 Qg ≈ 37nC 选取驱动电流 |
 | 电机 | 21 极对、减速比 12.5、额定 14A | 参数见 `FOC.H` |
 
@@ -65,15 +67,15 @@
 
 | 文件 | 职责 |
 |---|---|
-| `main.c` | 时钟 / 外设初始化、主循环调度（故障码上报、串口 / CAN 处理、**编码器刷新 `KTH7823_UpdateAngle/UpdateSpeed` + 1ms 节拍**）、nFAULT EXTI 回调（**不驱动 LED**） |
-| `motor_control.c` | 计算 `control_dt`、初始化各驱动、TIM1 中断回调（20kHz 跑电流采样 + `FOC_Update` + **`LED_Update()` LED 状态机**；`motor_ready` 后启动，故上电初始点亮保持到控制就绪）；**上电启动序列**（DRV8353 参数写入自检重试 → 参数校验打印 → IDLE，含硬件错误锁死门控；**不含自动对齐**） |
-| `FOC.C` | FOC 核心：状态机、变换、SVPWM、三级 PID 级联、开环转角度/悬停、故障退避与恢复握手、LED 状态机（20kHz 中断内，硬件错误慢闪 > 故障快闪 > 运行常亮） |
+| `main.c` | 时钟 / 外设初始化、主循环调度（故障码上报、串口 / CAN 处理、**`KTH7823_SlowUpdate()` 滤波角度 + 1ms 节拍**；不发起 SPI 帧）、nFAULT EXTI 回调（**不驱动 LED**） |
+| `motor_control.c` | 计算 `control_dt`、初始化各驱动、TIM1 中断入口 `FOC_TIM1_UpdateIRQHandler`（20kHz/50µs：`KTH7823_Tick` 编码器快路径 → 读注入组电流 → `FOC_Update` → **`LED_Update()`（每 20 拍 ≈1kHz 降频调用）**；`motor_ready` 后启动，故上电初始点亮保持到控制就绪）；**上电启动序列**（DRV8353 参数写入自检重试 → 参数校验打印 → IDLE，含硬件错误锁死门控；**不含自动对齐**） |
+| `FOC.C` | FOC 核心：状态机、变换、SVPWM、三级 PID 级联、开环转角度/悬停、故障退避与恢复握手、LED 状态机（控制中断内按 1kHz 调用，硬件错误慢闪 > 故障快闪 > 运行常亮） |
 | `PID.c` | 通用位置式 PID（微分先行 + clamping 抗饱和） |
 | `Protect.c` | 全部软件保护巡检 `Protect_FOC()`、统一停机入口 `Protect_StopPWM()` |
-| `sense.c` | ADC → 物理量换算（三相电流 / 母线电压 / NTC 温度）、零偏标定 |
+| `sense.c` | 采样链路组织（注入组 = A/B 两相电流，C 相由基尔霍夫合成；规则组 = 母线/MOS 温度）→ 物理量换算、零偏标定、`adc_inj_miss_cnt` 采样未就绪诊断 |
 | `DRV8353.C` | DRV8353F SPI 读写、寄存器配置、清故障 / 恢复 / 自检 |
-| `KTH7823.c` | 电机轴编码器角度与速度读取、滤波、多圈解包裹 |
-| `encoder2.c` | 第二（输出端）编码器角度 / 速度（芯片待定） |
+| `KTH7823.c` | 电机轴编码器：**快路径 `KTH7823_Tick()`（20kHz，中断内）**= 寄存器级 SPI 单帧 + 无效读数统计 + 多圈解包裹 + 测速(1kHz) + 一拍延迟外推补偿；**慢路径 `KTH7823_SlowUpdate()`（≈1kHz，主循环）**= sin/cos 低通 + atan2 |
+| `kth7823_2.c` | 第二（输出端）编码器角度 / 速度框架（芯片待定，`Encoder2_*`；仅 `Encoder2_Init()` 被调用，Update 未接入） |
 | `fdcan_app.c` | CAN 命令解析、状态反馈、多节点 ID、错误 / BusOff 监测、接收队列 |
 | `uart_cmd.c` | 串口命令行解析、状态打印、PID 在线调参、对齐结果上报 |
 | `dwt_delay.c` / `dbg_monitor.h` | 精确延时 / Keil Watch 调试快照 |
@@ -86,9 +88,10 @@
   闭环三态按**级联深度递增**（`TORQUE=3 < SPEED=4 < POSITION=5`），故直接用 `foc.mode >=` 判深度：
   `TORQUE`=仅电流环 / `SPEED`=+速度环 / `POSITION`=+位置环。
 - **模式编号**：串口 / CAN / 上报 / 保护共用同一套，且**直接使用 `(int)foc.mode`**，不再有任何映射函数。
-- **保护项**：堵转(>45A 且转速≈0)、编码器失效、通讯失联(CAN 心跳 20ms 超时)、过温(90℃ 关断 / 70℃ 恢复)、
-  母线过压(>32V)、欠压(<16V)、超速(230 rad/s)、单相峰值(55A)、I²t 热积累、位置跟随误差、软限位，
-  外加 DRV8353 硬件 nFAULT。
+- **保护项**：堵转(三相合成幅值 >36A 且 |转速| <3 rad/s)、编码器样本过期(连续 100 拍未接受有效角度，包括 SPI 失败 / 无效 raw / 野值，≈5ms)、通讯失联(CAN 心跳 20ms 超时)、
+  过温(90℃ 关断 / 70℃ 恢复)、母线过压(>32V)、欠压(<16V)、超速(230 rad/s)、单相峰值(40A)、I²t 热积累、
+  位置跟随误差、软限位，外加 DRV8353 硬件 nFAULT。
+  其中前 3 项（相峰值 / 堵转 / I²t）每拍巡检（20kHz），其余 7 项按 `control_tick % 10` 降至 **2kHz**。
 - **故障码** `FAULT_CODE_*`：0 无 / 1 硬件 / 2 堵转 / 3 编码器 / 4 过温 / 5 过压 / 6 欠压 / 7 超速 /
   8 相过流 / 9 I²t / 10 位置误差 / 11 软限位 / 12 通讯超时。
 - **故障掩码** `fault_mask`：位 n = `FAULT_CODE_n`（n=1..12，`FAULT_MASK_BIT()`）。`fault_code` 单值会
@@ -130,7 +133,7 @@ doog_drive/
 - **工具链**：Keil MDK-ARM V5.32（ARMCLANG V6.23），链接 ARM DSP 数学库 `arm_cortexM4lf_math.lib`。
 - **构建**：用 Keil 打开 `MDK-ARM/Drive.uvprojx` 编译；修改外设配置用 STM32CubeMX 打开 `Drive.ioc`。
 - **烧录**：SWD（PA13/PA14）。**烧录前按关节修改 `fdcan_app.h` 的 `NODE_ID`（1~12）**。
-- **调试**：Keil Watch 添加变量 `dbg` 一次查看全部运行状态；串口 `status` / `can` 做在线诊断。
+- **调试**：Keil Watch 添加变量 `dbg` 一次查看全部运行状态（`main.c` 主循环已每轮调用 `DBG_Monitor_Update()`，无需再取消注释）；串口 `status` / `can` / `log=1` 做在线诊断。临时性的 ISR 耗时打点（`isr` 命令、`isr_cyc_*`）已整段删除，如需测中断占用需临时用 DWT 打点。
 
 ## CAN 上位机控制指令说明
 
@@ -656,7 +659,8 @@ ol_move_and_hold(90.0, 5.0, 0.6, hold_seconds=2.0)
 
 - 下位机在**每收到一帧**时刷新"通讯心跳"（接收中断内 `Protect_CommFeed()`）。
 - **收到首帧之后**失联保护才开始生效（未联机时不误触发）。
-- 一旦生效，若连续 **20 ms**（`COMM_TIMEOUT_TICKS = 400 @ 20kHz`）没有收到任何新帧，则判定通讯失联：
+- 一旦生效，若连续 **20 ms**（`COMM_TIMEOUT_TICKS = 40`；慢保护每 10 拍巡检一次即 2kHz，40 × 0.5ms = 20ms）
+  没有收到任何新帧，则判定通讯失联：
   - 报故障 `FAULT: COMM_TIMEOUT`，
   - **停驱动并进入故障退避**。
 
@@ -722,6 +726,314 @@ ol_move_and_hold(90.0, 5.0, 0.6, hold_seconds=2.0)
 ---
 
 ## 更新记录
+
+### 2026-10-22 — 编码器刷新移入 TIM1 20kHz 中断：快/慢双路径 + 一拍延迟补偿、ISR 打点清理
+
+**背景**：闭环前置遗留项「换相角度源仍由主循环 1kHz 刷新，额定转速下电角频率 ≈639Hz 存在混叠」。
+编码器已改为单帧流水线（1 帧 ≈1.78µs @9MHz），SPI1 有余量承担 20kHz 采样；
+同时 `[TEMP]` 的 ISR 耗时打点（`t_body/t_sense/t_foc/t_led_max`、`isr_cyc_*`、串口 `isr` 命令）已完成使命，一并移除。
+
+**改动**
+
+1. `Core/Src/KTH7823.c` / `Core/Inc/kth7823.h`：新增 `KTH7823_Tick(uint32_t tick)`，**仅由 TIM1 20kHz 中断调用**（SPI1 单一所有者）：
+   - **每拍**：`spi_exchange_frame(0x0000)` 读 1 帧 → 0x0000/0xFFFF 计为无效读数（正常清零）→ 16 位带符号差值做多圈解包裹（跳变超 `KTH7823_UNWRAP_MAX_DELTA=1024` 判野值丢弃）→ 更新 `KTH7823_Angle_Multiturn`；
+   - **每拍**：用相邻两个有效帧的 DWT 间隔算角速度 ω，外推
+     `KTH7823_Angle_Multiturn_Comp = angle_unwrapped + ω × (KTH7823_ANGLE_DELAY_PERIODS × control_dt)`
+     （单帧流水线固有滞后 1 拍 = 50µs；ω 限幅 ±400 rad/s 防坏帧飞出）；
+   - **每 20 拍（≈1kHz）**：DWT 差分测速（窗口 ≈1ms，避免逐拍量化噪声）+ `encoder_update_count++`。
+2. SPI 收发改为**寄存器级 + DWT 限时**（`KTH7823_SPI_TIMEOUT_US = 10`）：HAL 的毫秒超时依赖 SysTick（优先级 15），在 TIM1 中断里无法推进，一旦卡住会永不返回、把 PWM 冻结在最后占空比。失败路径读 `DR`/`SR` 清 `OVR`、关开 `SPE` 复位 FIFO，并累加 `kth7823_spi_err_cnt`（现场快照 `kth7823_diag_cr1/sr`）；`spi_in_frame` 拒绝重入，绝不并发拉 CS。
+3. 慢路径 `KTH7823_SlowUpdate()` 留在主循环（≈1kHz）：只读中断缓存的 raw 做 sin/cos 一阶低通 + atan2 → `KTH7823_Angle_Rad/_Deg`（开环起始角、对齐平均、上报）。实测该段 ≈7µs，放进 20kHz 会顶穿 50µs 预算；α 语义不变。
+4. `KTH7823_RAW_FAULT_LIMIT` 8 → **100 拍**（20kHz 下 ≈5ms，与原「1kHz × 8 次 ≈8ms」同量级，避免提高刷新率后抗扰能力下降 10 倍）。
+5. `Core/Src/motor_control.c`：`FOC_TIM1_UpdateIRQHandler()` 顺序改为
+   `s_tick` → `KTH7823_Tick(control_tick)` → `CurrentSense_Update()` → `FOC_Update()` → `LED_Update()`（**每 20 拍调用一次**，≈1kHz；LED 按 ms 计时，观感不变，省约 1.2µs/拍）。
+6. `Core/Src/FOC.C`：闭环（TORQUE/SPEED/POSITION）机械角源改为 `KTH7823_Angle_Multiturn_Comp`；开环悬停/回拉、对齐、上报仍用未补偿的 `KTH7823_Angle_Multiturn`（行为不变）。
+7. `Core/Src/main.c`：主循环不再调 `KTH7823_UpdateAngle/UpdateSpeed`，改为 `KTH7823_SlowUpdate()`；`DBG_Monitor_Update()` **恢复为每轮调用**（`dbg` 快照重新实时刷新）。
+8. `Core/Src/uart_cmd.c`：阻塞式 `ang=` 测试的三个循环不再自己发起 SPI 帧（中断已持续刷新角度），只保留喂狗 + 串口泵；删除 `isr` 命令与 `status` 末尾的 ISR 耗时附行。
+9. `Core/Src/stm32g4xx_it.c`：删除 `isr_cyc_max/min/cnt/over_cnt/sum` 打点变量。
+
+**影响**
+
+- 20kHz 中断新增约 3~4µs（1.78µs 编码器帧 + 解包裹/外推），相对 50µs 预算仍有余量；SPI1 占用率约 3.6%。
+- 角度与电流环**同拍更新**，闭环角度源的混叠问题消除；读数固有滞后 1 拍由 `_Comp` 外推补偿，`KTH7823_ANGLE_DELAY_PERIODS` 可台架微调（0.5~1.5）。
+- 编码器保护使用 `kth7823_stale_ticks` 跟踪有效样本年龄；SPI 失败、无效 raw 和解包裹野值都不会清零。连续 100 拍未更新即停机，恢复前必须重新收到有效样本。
+- `FOC_CLOSEDLOOP_ENABLE` 仍为 **0**，闭环功能本身未启用。
+
+**验证（台架待做）**
+
+- Keil 编译 0 Error；`dbg.control_tick` 稳定增长、`dbg.tick` 与 1ms 节拍同步。
+- `status` 的 `InjMiss` 长期 0、静止时 `Speed≈0`、`dbg.kth_raw_fault_cnt` 长期 0、`kth7823_spi_err_cnt` 长期 0。
+- 手转电机轴：`kth7823_unwrap_glitch_cnt` 不应持续增长；`kth7823_diag_cr1/sr` 应为 0（无失败帧）。
+- 开环 `v=`/`ang=` 行为与改动前一致；串口 `ang=` 阻塞期间 LED 仍按状态机刷新。
+
+**关联文件**：`Core/Inc/kth7823.h`、`Core/Src/KTH7823.c`、`Core/Src/motor_control.c`、`Core/Src/FOC.C`、
+`Core/Src/main.c`、`Core/Src/uart_cmd.c`、`Core/Src/Protect.c`（注释）、`Core/Src/stm32g4xx_it.c`。
+
+### 2026-10-22 — 采样链复查收尾：JEOS 写清、母线采样时间、ADC2 中断开销、零偏校验
+
+**背景**：复查 10-21 的采样链重构，发现 4 个问题：
+
+1. **`JEOS` 从来不会被清除**。`CurrentSense_Update()` 判 `JEOS` 后只读 JDR，没有任何清零动作。
+   STM32G4 的 `ADC_ISR` 是 **w1c** 架构（`stm32g4xx_hal_adc.h`：“bit cleared by writing 1 (writing 0 has no
+   effect on any bit of register ISR)”），且读 `JDRx` **只清 `JEOC`**、不清 `JEOS`
+   （RM0440 `ADC_ISR` bit5 JEOC：“cleared by software writing 1 to it **or by reading the corresponding
+   ADC_JDRy register**”；bit6 JEOS 只有“cleared by software”；HAL 的
+   `HAL_ADCEx_InjectedGetValue()` 文档亦明确“does not clear ADC flag JEOS”）。
+   后果：`JEOS` 从第一次注入序列完成起永久为 1，`adc_inj_miss_cnt`（串口 `InjMiss`）**恒为 0** ——
+   而它正是判断“提前量 `CCR4` 是否足够 / TIM1_CH4 触发链是否接通”的唯一量化指标，
+   即上一次重构的核心验收项实际是失效的。
+2. **母线 CH8 采样时间偏短**：CH8 经 100kΩ 串阻进 ADC，源阻抗 ≈100k，
+   24.5cyc（0.68µs）≈1.36τ（τ=100k×5pF=500ns），而 12 位需要 ≈8.3τ。
+3. **ADC2 链路中断开销**：`HAL_ADC_Start_DMA()` 会同时打开 TC/HT，一条 1ms 才用一次的温度通道
+   却按 20kHz 产生 40k 次/秒中断。
+4. **零偏标定无合理性判断**：64 次平均结果被无条件信任，标定时电机若被外力带动会静默标错。
+
+**改动**
+
+1. `Core/Src/sense.c` `CurrentSense_Update()`：判标志 → 读 `JDR1/JDR2` → **`ADC1->ISR = ADC_ISR_JEOS;`**
+   - w1c 写 1 清，编译为单条 STR，只清 bit6；
+   - **禁止写成 `ADC1->ISR |= ADC_ISR_JEOS;`**：读-改-写会把当前所有置位标志（`OVR`/`JEOC`/`AWDx`）一起清掉；
+   - 每拍清一次后，`InjMiss` 才真正具备诊断能力（正常长期 0；提前量不足或触发链断则 20kHz 增长）。
+2. `Core/Src/adc.c` + `Drive.ioc`：CH8 采样时间 24.5cyc → **`ADC_SAMPLETIME_247CYCLES_5`**（6.9µs ≈13.8τ）；
+   CH4（MOS NTC）保持 24.5cyc（源阻抗 10k‖10k=5k，0.68µs 已是 27τ，足够）。
+   规则组总耗时变为 (24.5+12.5 + 247.5+12.5)/36MHz = **8.25µs**，仍远小于到下一次 CC4 触发的 46µs。
+3. `Core/Src/sense.c` `CurrentSense_Init()`：ADC2 启动后
+   `__HAL_DMA_DISABLE_IT(hadc2.DMA_Handle, DMA_IT_TC | DMA_IT_HT | DMA_IT_TE)` ——
+   循环搬运保留（`adc2_values_ntc[0]` 仍每 50µs 刷新），只关中断，省 40k 次/秒。
+4. `Core/Inc/sense.h` + `Core/Src/sense.c`：新增零偏合理性校验（**不阻塞**，只置标志）。
+   阈值 **`I_OFFSET_MAX_A = 2.5 A`**（1 LSB = 40.3 mA，2.5 A ≈ 62 counts ≈ 50 mV）
+   + **`I_OFFSET_DIFF_MAX_A = 1.0 A`**（两相零偏差值，专抓单通道故障：某相 shunt / 走线 / INA240）。
+   误差预算（0 A 时）：INA240A1 Vos ±25µV ≈ **0.001 A**；VREF 1% 分压误差 ≈ **0.83 A**；
+   ADC 失调 ≈ **0.1 A**；故障量级为 **±82.5 A**（注入组未启动 / INA240 输出开路或饱和）。
+   - 超限只置 `sense_hw_error`，**不再 `Error_Handler()`**：IWDG（≈1s）复位会造成上电复位循环，
+     台架表现为“不亮灯 / 无串口”，反而更难排查；
+   - `sense_hw_error` 由 `MotorControl_CommandGate()`（拒绝控制命令，UART/CAN 同一入口）与
+     `MotorControl_BootIsHwError()`（LED 慢闪）消费，与 `boot_hw_error` 同一通路；
+     `MotorControl_BootSequence()` 额外打印实测零偏值与排查提示，并 `DRV8353_Disable()` +
+     `Protect_StopPWM()`（标定不可信时不让功率级带电待命：三相下桥全通且电流读数本身带偏置）；
+   - 新增观测量 `cal_offset_A/B`（单位 A，标定结果快照）；20kHz 热路径仍用 `static` 变量，
+     避免中断里因 `volatile` 反复重载。
+5. `Core/Inc/sense.h`：统一导出 `sense_hw_error` / `cal_offset_A` / `cal_offset_B`
+   （原由 `motor_control.c` 手写 `extern`，易漏 `volatile`）；删除未使用的 `ADC_TRIG_LEAD_US`；
+   时序注释由“推演”改为**实测结论**。
+
+**已验证（结论）**
+
+- 中心对齐 + RCR=1，CNT 上电自 0 起计：**UEV 落在下溢（谷点 CNT=0）**，与设计假设一致；
+  故 `CCR4=288`（4µs@72MHz）确实是“UEV 前 4µs”，注入组 2 通道 2.06µs 转换在 UEV 前约 1.94µs 完成，
+  FOC 更新中断读到的就是当拍新样本。（若日后改 PWM 模式，需改 PWM2 + `CCR4=ARR-288`。）
+- 母线/温度链 CPU 开销归零：ADC2 侧 TC/HT/TE 中断已关；ADC1 侧仍保留（见待办）。
+
+**待办（未做，如实记录）**
+
+- `CurrentSense_Init()` 用 `HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4)` 置 CC4E，对 TIM1 **会顺带置 MOE**
+  （`stm32g4xx_hal_tim.c:1494-1498`）并重复置 CEN（`1500-1512`）。**已核对：本次不改代码**，
+  理由与前置条件见下节“执行流程核对”——换个写法功能等价，收益止于语义，代价是把
+  “`Base_Start_IT` 必须先于 `CurrentSense_Init`”从 HAL 自管理降级成隐式契约。
+- ADC1 规则组 DMA 的 TC/HT 中断仍在（40k 次/秒，唯一用途是置一次 `adc_dma_ready`），
+  探测完成后可同样 `__HAL_DMA_DISABLE_IT(hadc1.DMA_Handle, ...)`。
+- 零偏失败时已 `DRV8353_Disable()`，但若 DRV8353 在 sleep 下会拉低 nFAULT，则 nFAULT EXTI 会置
+  `fault_triggered` → FOC 进 FAULT → `FOC_FaultRecoverProcess()` 复原并重新使能 EN（等于撤销上面的关断）。
+  台架若观察到该现象，需在恢复路径加 `MotorControl_BootIsHwError()` 守卫；本次未改 FOC 状态机，避免扩大改动面。
+
+**已就地修正的注释（原与实况不符）**：`Core/Src/sense.c` 与 `motor_control.c` 中“此时 DRV8353 未使能”
+的说法有误 —— `DRV8353_Init()` 早已拉高 `ENABLE`；零偏成立的真实原因是 **TIM1 三路 PWM 未启动（INH 全低）
+→ 三相下桥全通 + 转子静止 → 相电流为 0**。这条更正同时说明了“上电瞬间转子被带动会标错零偏”的成因。
+
+**已恢复的注释**：`Core/Src/tim.c` 中 TIM1 的时序约定注释块（`USER CODE BEGIN TIM1_Init 1`，含
+`f_pwm=20kHz`、`RCR=1→UEV 落在下溢【实测】`、`control_dt=50µs`、TRGO/规则组 8.25µs、
+CH8 247.5cyc、`CCR4=288` 提前量、CH4 不占引脚、JEOS w1c、`HAL_TIM_PWM_Start` 顺带置 MOE
+及其替代写法）此前在整理中被删除，现已恢复并与实测结论一致；`sense.h` 只覆盖“CCR4=提前量”那一半约定。
+（注：该注释块中“DRV8353 ENABLE 未拉高”一句与实况不符 —— `DRV8353_Init()` 已在 `MotorControl_Init()`
+第 46 行拉高 PA11。按“只改文档、不动代码”的约定暂未回写 `tim.c`，以本节与下节为准。）
+
+**执行流程核对（`HAL_TIM_PWM_Start(CH4)` 能否换成 `TIM_CCxChannelCmd`）**
+
+结论：**在现有调用顺序下功能等价，但本次不改代码**。换法可行，然而收益仅是语义：
+它把“计数器已启动”从 HAL 自管理降级为“`HAL_TIM_Base_Start_IT()` 必须先于 `CurrentSense_Init()`”的隐式契约。
+
+启动顺序（`Core/Src/motor_control.c`，行号为该文件）：
+
+| 位置 | 动作 | CEN | MOE | CC1E~CC3E | CC4E | PA11 EN | PB12 PWM_COTR |
+|---|---|---|---|---|---|---|---|
+| 46 | `DRV8353_Init()`（内含 `DRV8353_Enable()`） | 0 | 0 | 0 | 0 | **1** | 0 |
+| 70 | `HAL_TIM_Base_Start_IT()` | **1** | 0 | 0 | 0 | 1 | 0 |
+| 78 → `sense.c:44-45` | `CCR4=288` + `HAL_TIM_PWM_Start(CH4)` | 1 | **1** | 0 | **1** | 1 | 0 |
+| 78 → `sense.c:53` | `HAL_ADCEx_InjectedStart()` | 1 | 1 | 0 | 1 | 注入组武装 | 0 |
+| 81-83 | `HAL_TIM_PWM_Start(CH1~CH3)` | 1 | 1 | **1** | 1 | 1 | 0 |
+| 86 | `DRV8353_PWM_ctrl_ON()` | 1 | 1 | 1 | 1 | 1 | **1** |
+
+`HAL_TIM_PWM_Start` 实际做 4 件事（`stm32g4xx_hal_tim.c:1475-1516`）：① `ChannelState=BUSY`；
+② `TIM_CCxChannelCmd(...ENABLE)` 置 CC4E；③ `__HAL_TIM_MOE_ENABLE`；④ `__HAL_TIM_ENABLE` 置 CEN。
+而 `TIM_CCxChannelCmd` 只写 `CCER` 对应位（`8117-8132`），即只保留 ②。
+
+逐项依赖：
+
+- **CC4E**：唯一功能必需的位，换法仍保留 → 注入组触发链不变。
+- **CEN**：第 70 行 `HAL_TIM_Base_Start_IT()` 内部已 `__HAL_TIM_ENABLE`（`474-509`），故第 45 行的 CEN 是冗余。
+  副作用是：换法后若有人把 `CurrentSense_Init()` 挪到第 70 行之前，CC4 永不触发 → 卡在 `sense.c`
+  “50ms 无数据”的 `Error_Handler()`（fail-fast，不会静默跑错）。
+- **MOE**：不参与 `T1_CC4 → ADC 注入组` 的触发通路（MOE 只作用在最后一级输出使能）；此刻
+  `CC1E~CC3E=0`，且 BDTR 的 `OSSR`/`OSSI` 均为 `DISABLE`（`Core/Src/tim.c:120-121`），MOE 由 1 变 0 时
+  输出是“释放/高阻”而非被拉到 `OISx` 电平，引脚行为一致；第 81 行启用 CH1 时 MOE 必然被补上。
+  旁证：故障路径 `Protect_StopPWM()`（`Core/Src/Protect.c:39-51`）就是清 `CC1E~CC3E` + 清 MOE，
+  但**保留 CEN 与 CC4E** —— 若 MOE=0 会掐断 CC4 触发，FAULT 态下 `InjMiss` 会暴涨，与实测不符。
+- **HAL 通道状态**：换法后 CH4 的 `ChannelState` 停在 `READY`。全工程没有第二处对 CH4 调
+  `PWM_Start/Stop`（已全仓搜索），本版本 `HAL_TIM_PWM_Stop`（`1531-1553`）也不检查通道状态，
+  故当前无影响；但**永远不要对 CH4 调 `HAL_TIM_PWM_Stop`** —— 它会清 MOE 并 `__HAL_TIM_DISABLE`（清 CEN），
+  采样与 FOC 节拍会一起停。调试量 `dbg.pwm_out`（`FOC.C:1026-1032`）只读 CEN/MOE/CC1E~CC3E，不受影响。
+
+若日后确要改（前置条件缺一不可）：
+
+```c
+TIM1->CCR4 = ADC_TRIG_CCR4;
+if ((TIM1->CR1 & TIM_CR1_CEN) == 0u) Error_Handler();   /* 依赖 HAL_TIM_Base_Start_IT() 先行 */
+TIM_CCxChannelCmd(TIM1, TIM_CHANNEL_4, TIM_CCx_ENABLE); /* 只置 CC4E，不碰 MOE/CEN */
+```
+
+台架判据（改动后立刻验证，风险点会立即暴露而非静默）：`status` 中 `InjMiss` 长期为 0、
+`ControlDt 50.00 us PASS`、`cal_offset_A/B` 在 ±2.5A 内。
+
+**验证（台架）**
+
+- `InjMiss` 长期为 0（修复前恒 0 不可信；若现以约 20kHz 增长 → 提前量不足或触发链断）。
+- 静止时 `current_A/B ≈ 0`；±1A ≈ 24.8 counts；上电 `cal_offset_A/B` 应在 ±2.5A 内、两相差 <1A，
+  此时 `sense_hw_error == 0`；超限时串口应打印 `[BOOT] ERROR: current-sense zero offset out of range`
+  且控制命令被拒（LED 慢闪），系统仍可 `status`/`help`/`fault` 诊断。
+- 母线电压与万用表误差 <2%（CH8 长采样时间后应更稳）。
+- `adc2_values_ntc[0]` 在 25℃ ≈2047，`NTC_Temp` 接近室温（此前若 ADC2 未启动会读成约 -90℃ 假值）。
+
+**关联文件**：`Core/Src/sense.c`、`Core/Inc/sense.h`、`Core/Src/adc.c`、`Core/Src/motor_control.c`、
+`Core/Src/tim.c`（TIM1 时序约定注释恢复）、`Drive.ioc`。
+
+### 2026-10-21 — 电流采样链路重构：ADC1 注入组 + TIM1_CH4 移相触发、换算系数修正
+
+**背景**：ADC1 规则组由 4 通道改为 2 通道（CH4/CH8）后，`sense.c` 仍按 4 通道取数：
+`adc_values[0/1]`（本应是 A/B 相电流）实际是 MOS 温度与母线分压，`adc_values[2/3]` 只是它们的旧副本；
+A/B 相电流所在的注入组（CH2/CH3）从未启动、也从未读过 JDR。结果是电流恒在 0 附近，
+母线/温度读数"看起来正常"但实际取错通道，电流环与过流/过温/母线保护全部失准。
+另外 `ADC_TO_Sense = 4095×3.3`、`I_K = 1/(4095×3.3×20×0.001)` 乘除颠倒，
+电流读数只有真实值的 9.18%（零点标定会吸收偏置，掩盖增益错误）。
+
+**改动**
+
+1. 采样分工（方案 B）
+   - `Core/Src/adc.c` / `Drive.ioc`：ADC1 注入组触发源 `T1_TRGO` → **`ADC_EXTERNALTRIGINJEC_T1_CC4`**；
+     规则组保持 rank1=CH4(PA3, MOS 温度)、rank2=CH8(PC2, 母线)，DMA 长度 = 2 半字。
+   - `Core/Src/sense.c`：新增 `adc1_values_reg[2]`（规则组/DMA，`[0]`=MOS 温度、`[1]`=母线）、
+     `adc1_values_inj[2]`（注入组/中断读 JDR，`[0]`=A 相、`[1]`=B 相），ADC2 缓冲更名
+     `adc2_values_ntc[1]`（NTC），删除 `adc_values[4]`。`CurrentSense_Update()` 改为
+     `判 JEOS → 读 ADC1->JDR1/JDR2 → 算 A/B/C → 母线中值滤波读 adc1_values_reg[1]`；
+     `TempSense_Update()` 改读 `adc1_values_reg[0]` / `adc2_values_ntc[0]`。`CurrentSense_Init()` 内完成
+     `TIM1->CCR4=288` → `HAL_TIM_PWM_Start(htim1, CH4)`（置 CC4E）→ 规则组/ADC2 DMA →
+     `HAL_ADCEx_InjectedStart()` 一次武装 → 等首帧 → 64 次平均零偏（注入组）。
+2. 采样时序（解决"电流采样落后于 FOC 更新"）
+   - `Core/Src/tim.c`：TIM1 `TRGO` 由 `OC4REF` 改回 **`UPDATE`**（`Drive.ioc` 同步）；
+     `ARR=1799`、`RCR=1` → PWM 20kHz、更新中断 20kHz（UEV 落在下溢/谷点）、`control_dt=50µs`。
+   - CH4（PWM1、无引脚输出）在下行段经过 `CCR4` 时产生上升沿，距下溢还有 `CCR4` 个计数，
+     故 **`CCR4=288`（4µs@72MHz）** → 注入组在 UEV 前 4µs 采样，2 通道转换 2.06µs，
+     UEV 前约 1.94µs 完成，更新中断读到即当拍值。
+   - 必须显式 `HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4)`：`HAL_TIM_PWM_ConfigChannel()` 不置 CC4E，
+     改造前该位一直未使能。
+3. 换算系数修正（`Core/Inc/sense.h`）
+   - `ADC_TO_Sense`：`4095×3.3` → **`4095/3.3`**（counts/V ≈1240.9）。
+   - `I_K`：`1/(4095×3.3×20×0.001)` → **`3.3/(4095×20×0.001)`**（≈0.04029 A/count，量程回到 ±82A）。
+     `CurrentSense_Calculate()`（零偏路径）与 `CurrentSense_Update()`（实时路径）必须同批改，否则两者不自洽。
+4. 可观测性
+   - `sense.c` 新增 `adc_inj_miss_cnt`：更新中断入口若 `ADC_ISR_JEOS` 未置位则累加，
+     用于台架判断提前量（CCR4）是否足够、TIM1_CH4 触发链是否接通。
+   - `Core/Src/uart_cmd.c`：`status` 与自动上报的 `ADC_A/ADC_B` 改读 `adc1_values_inj[]`，并新增 `InjMiss=` 计数。
+5. 其它
+   - `Core/Src/motor_control.c`：ADC 校准只保留单端（原先前一次 `DIFFERENTIAL_ENDED` 无意义），
+     补 `hadc2` 校准；注释说明采样初始化顺序。
+   - `Core/Inc/Protect.h`：节拍注释按 RCR=1 改写（慢保护 `*_TICKS` 后续已随巡检降频同步 ÷10，
+     见同日「遗留项复查：保护巡检分频」条目）。
+   - `Core/Src/sense.c` / `Core/Inc/sense.h`：采样缓冲命名统一为 `adc1_values_reg`（规则组 DMA）、
+     `adc1_values_inj`（注入组）、`adc2_values_ntc`（NTC），并取消 `ADC1_REG_IDX_*` / `ADC_INJ_IDX_*`
+     索引宏，直接按 ADC rank 顺序以 `[0]` / `[1]` 索引（三者均为全局 `volatile`，供 DMA/ISR 与主循环共享）。
+
+**残留延迟（如实记录）**：本次消除的是"采样 → 中断读到旧数据"（原 25~50µs，且一半控制拍复用同一样本）；
+"本拍计算、下一拍 UEV 装载新 CCR"这 1 拍（50µs）由 CCR 预装载（`OCxPE`）决定，是中心对齐 PWM 的固有延迟。
+
+**验证（待执行）**：需在 Keil 中重新编译确认 0 Error，并在台架确认 —— PWM 周期 50µs、
+串口 `ControlDt 50.00 us PASS`、`InjMiss` 长期为 0、静止时 `current_A/B≈0`、±1A 约对应 25 counts、
+母线电压与万用表误差 <2%、MOS 温度与线圈温度互不串扰、开环起转时采样点不落在开关沿。
+
+> 其中 `InjMiss` 一项在 10-22 补齐 `JEOS` 写 1 清零后才真正有效（此前该计数恒为 0），见上方
+> 2026-10-22 条目。
+
+**遗留**：RCR=1 时 UEV 落在下溢这一前提需实测确认（**已由 2026-10-22 条目实测确认：落在下溢/谷点**；
+若日后改 PWM 模式，需改 PWM2 + `CCR4=ARR-288`）；
+A/B 相在同一 ADC1 上顺序采样存在约 1.03µs 偏斜（单 ADC 固有）。
+
+**关联文件**：`Drive.ioc`、`Core/Src/tim.c`、`Core/Src/adc.c`、`Core/Src/sense.c`、`Core/Inc/sense.h`、
+`Core/Src/uart_cmd.c`、`Core/Src/motor_control.c`、`Core/Inc/Protect.h`。
+
+### 2026-10-21 — 2026-10-20 遗留项复查：保护巡检分频、TIM1 中断直连 UIF、SysTick 优先级
+
+**背景**：对 2026-10-20「FOC 20kHz 控制中断（ISR）复查」条目下的 9 项遗留逐项核对当前代码
+（比对 `ff8940b` 之后的改动）。结论：**第 6、7、8 项已处理，第 5 项部分处理，第 1、2、3、4、9 项未动**。
+
+**已处理：保护巡检分频（原遗留 6）**
+
+- `Core/Src/Protect.c` `Protect_FOC()`：前 3 项快速保护 `Protect_PhasePeakCheck()` / `Protect_StallCheck()` /
+  `Protect_I2tCheck()` 仍每拍跑（20kHz）；其后新增 `if (control_tick % 10u != 0u) return;`，
+  其余 7 项（位置跟随、软限位、编码器、过温、母线电压、超速、通讯失联）降到 **2kHz**（每 10 拍一次）。
+- `Core/Inc/Protect.h`：慢保护阈值同步 ÷10 以保持毫秒语义——`POS_ERR_TIMEOUT_TICKS` 1000→**100**、
+  `SOFT_LIMIT_TIMEOUT_TICKS` 400→**40**、`COMM_TIMEOUT_TICKS` 400→**40**、`OVERSPEED_CONFIRM_TICKS` 50→**5**；
+  `BUS_TRIP_CONFIRM_TICKS` 10→**1**（10 拍 @20kHz → 1 拍 @2kHz，同为 0.5ms）。
+- `Core/Src/FOC.C`：删除闭环位置分支内对 `Protect_PositionErrorCheck()` / `Protect_SoftLimitCheck()` 的重复调用，
+  位置类保护统一由 `Protect_FOC()` 的 2kHz 巡检负责。
+- 影响：20kHz 中断内的保护巡检项由 11 项降为 3 项（+ 每 10 拍 7 项），拍内开销下降；
+  毫秒语义不变（失联仍 20ms），但慢保护最坏判定延迟由 50µs 变为 500µs。
+
+**已处理：TIM1 中断直连 UIF（原遗留 7）**
+
+- `Core/Src/stm32g4xx_it.c`：`TIM1_UP_TIM16_IRQHandler()` 不再调用 `HAL_TIM_IRQHandler(&htim1)`（该行已注释），
+  改为判 `TIM1->SR & TIM_SR_UIF` → 写 `SR` 清 UIF → 直接调 `FOC_TIM1_UpdateIRQHandler()`。
+- `Core/Src/motor_control.c`：原 `HAL_TIM_PeriodElapsedCallback()`（含 `htim->Instance == TIM1` 判断）
+  改名为 `FOC_TIM1_UpdateIRQHandler(void)`，函数体不变（`s_tick` 采集 → `CurrentSense_Update()` →
+  `motor_ready` 时 `FOC_Update()` + `LED_Update()` → `control_tick++`）。
+- `Core/Inc/motor_control.h` 补原型；`Core/Src/main.c` 删除 `HAL_TIM_PeriodElapsedCallback` 的前置声明。
+- 影响：省掉 HAL 的 8 路 flag 分发与回调间接跳转。⚠️ 由于整条 `HAL_TIM_IRQHandler` 被注释，
+  若以后启用 TIM1 的其它中断源（CC / Break 等）需自行补处理。
+
+**已处理：SysTick 优先级（原遗留 8）**
+
+- `Core/Inc/stm32g4xx_hal_conf.h`：`TICK_INT_PRIORITY` 0 → **15**（最低优先级）。
+- `Drive.ioc`：`NVIC.SysTick_IRQn` 同步由 0 改 15，CubeMX 重新生成不会被改回。
+- 影响：SysTick 不再抢占 EXTI(0) / TIM1(1) / DMA·FDCAN·USART3(3)，`HAL_GetTick()` 的节拍处理不会再插进
+  20kHz 控制中断；反之 SysTick 自身现在会被上述中断抢占（对 1ms 计时语义无影响）。
+
+**部分处理：Park / 逆 Park 的 sin/cos（原遗留 5）**
+
+- `Core/Src/FOC.C`：`FOC_Park()` / `FOC_InversePark()` 各自由 `arm_sin_f32()` + `arm_cos_f32()` 两次调用
+  改为一次 `arm_sin_cos_f32()`（该函数入参为角度制，故传入 `foc.angle * 57.29578f`）。
+- 一拍内 sin/cos 查表由 4 次降为 2 次（Park 一组 + 逆 Park 一组）；**两者之间仍未共用同一组**，
+  原遗留中"一拍白算一组"的问题依旧存在，继续保留为遗留项。
+
+**未动（逐项核对结果）**
+
+| 原遗留项 | 现状 |
+|---|---|
+| 1. `fault_triggered` 读-清无临界区 | 未改，`FOC.C` 仍为 `if (fault_triggered) { fault_triggered = 0; ... }`，无 `__disable_irq()` / 原子交换 |
+| 2. ADC 触发在 UEV | **已处理（见上方 2026-10-21「电流采样链路重构」条目）**：电流改走 ADC1 注入组，由 TIM1_CH4 比较事件在 UEV 前 4µs 触发（`CCR4=288`），更新中断读到当拍样本 |
+| 3. 温度更新在主循环 | 未改，`TempSense_Update()` 仍在 `main.c` 主循环调用，串口 `ang=` 阻塞与 `DRV8353_Recover()` 期间仍有盲区 |
+| 4. SVPWM 三个 `switch` | 未改，`FOC_SVPWM()` 仍是 sector→S、S→T1/T2、S→Ta/Tb/Tc 三段 `switch`，未改零序注入 |
+| 9. 闭环角度源 1kHz | ~~未改~~ **已处理（2026-10-22）**：编码器刷新移入 TIM1 20kHz 中断，闭环角度源改用一拍延迟补偿角；`FOC_CLOSEDLOOP_ENABLE` 仍为 0 |
+
+**同批改动（不在遗留清单内，供对照）**
+
+- `Core/Inc/Protect.h` 阈值调整：`STALL_CURRENT_LIMIT` 45→**36 A**、`STALL_SPEED_THRESHOLD` 10→**3 rad/s**、
+  `PHASE_PEAK_CURRENT_LIMIT` 55→**40 A**（README 正文「保护项」一栏已同步为 36A/40A）。
+- `Core/Src/main.c` 的 `manual_voltage` / `manual_speed` 定义迁移到 `Core/Src/motor_control.c`。
+- `Drive.ioc` 的 `ProjectManager.functionlistsort` 去掉 `MX_TIM3_Init`（TIM3 已废弃，见 2026-10-19 条目）。
+- `Protect.h` 中 `BUS_TRIP_CONFIRM_TICKS` 的注释已改为"1 拍"，但毫秒标注误写为"5ms @2kHz"
+  （1 拍 @2kHz 应为 **0.5ms**），注释仍待修。
+
+**验证**：本轮仅做代码比对（`git diff --cached` 与源码核对），未重新编译、未做实测。
+
+**关联文件**：`Core/Src/Protect.c`、`Core/Inc/Protect.h`、`Core/Src/FOC.C`、`Core/Src/motor_control.c`、
+`Core/Inc/motor_control.h`、`Core/Src/main.c`、`Core/Src/stm32g4xx_it.c`、`Core/Inc/stm32g4xx_hal_conf.h`、`Drive.ioc`。
 
 ### 2026-10-20 — FOC 20kHz 控制中断（ISR）复查：统一时间基准、nFAULT 快速停机、浮点算力优化
 
@@ -830,22 +1142,33 @@ fault_triggered = 1;
 
 **遗留（下一批，按优先级）**
 
+> **状态复查（2026-10-21）**：第 6、7、8 项已处理，第 5 项部分处理；第 1、2、3、4、9 项仍未动。
+> 逐项核对细节见上方 [2026-10-21 条目](#2026-10-21--2026-10-20-遗留项复查保护巡检分频tim1-中断直连-uifsystick-优先级)。
+
 1. `fault_triggered` 的"读-清"无临界区：EXTI 优先级 0 高于 TIM1，若插在
    `if (fault_triggered) { fault_triggered = 0; }` 之间会丢失新故障事件（表现为已停机但不进
    `FOC_STATE_FAULT`、不自动恢复）。
 2. ADC 触发仍在 UEV（`T1_TRGO`）：采样点正好落在三相同时换向的时刻，且 ISR 读到的是上一拍数据，
    叠加 CCR 预装载（`OCxPE`）→ 电流环纯延迟约 2 拍（100µs）。建议改 TRGO2/CC4 偏移触发（零矢量中段）。
+   → **已处理（2026-10-21）**：电流改 ADC1 注入组，TIM1_CH4 在 UEV 前 4µs 触发，更新中断内读 JDR1/JDR2；
+   采样数据陈旧延迟由 25~50µs 降为 0（残余的"本拍计算、下一拍 UEV 装载 CCR"1 拍 = 50µs 是预装载固有延迟）。
 3. 温度更新位于主循环（`main.c` 的 `TempSense_Update()`，≈1kHz）：过温保护本身有效，但串口 `ang=`
    阻塞（最长 ≈8s，且正是带电流保持的工况）与 `DRV8353_Recover()`（≈12ms）期间温度不刷新，
    判定存在盲区。建议改到 20kHz 中断内按 20~50ms 分频调用，或在这两条阻塞路径里补调用。
 4. SVPWM 现存三个 `switch`（sector→S、S→T1/T2、S→Ta/Tb/Tc），可换零序注入（min/max 中点钳位），
    需用示波器比对占空比等效性。
 5. Park / 逆 Park 各算一次 `sin/cos`，可共用一次（闭环一拍白算一组）。
+   → **部分处理（2026-10-21）**：两处各自由 2 次查表改为 1 次 `arm_sin_cos_f32()`（一拍 4→2 次），两者之间仍未共用。
 6. 保护巡检未分频（8 项全在 20kHz 跑）；若降频，`Protect.h` 的 `*_TICKS` 需同步 ÷10。
+   → **已处理（2026-10-21）**：3 项快速保护留 20kHz，其余 7 项按 `control_tick % 10` 降至 2kHz，`*_TICKS` 已同步 ÷10。
 7. `TIM1_UP_TIM16_IRQHandler` 仍走 `HAL_TIM_IRQHandler` 的 8 路 flag 分发，可直连 `UIF`。
+   → **已处理（2026-10-21）**：改为直判 `UIF` + 调 `FOC_TIM1_UpdateIRQHandler()`，`HAL_TIM_IRQHandler` 已注释。
 8. `SysTick` 的 `TICK_INT_PRIORITY` 仍为 0（`stm32g4xx_hal_conf.h`），会排在 TIM1 之前，建议改 15。
+   → **已处理（2026-10-21）**：已改为 15，`Drive.ioc` 的 `NVIC.SysTick_IRQn` 同步。
 9. 闭环前置：换相角度源仍由主循环 1kHz 刷新，额定转速下电角频率 ≈639Hz 存在混叠，
    开 `FOC_CLOSEDLOOP_ENABLE` 前必须先提高角度刷新率。
+   → **已处理（2026-10-22）**：编码器快路径移入 TIM1 20kHz 中断（`KTH7823_Tick`），闭环角度源改用一拍延迟补偿角
+   `KTH7823_Angle_Multiturn_Comp`；慢路径滤波仍在主循环 1kHz。
 
 **关联文件**：`Core/Src/motor_control.c`、`Core/Inc/motor_control.h`、`Core/Src/FOC.C`、`Core/Inc/FOC.H`、
 `Core/Src/Protect.c`、`Core/Src/main.c`、`Core/Src/DRV8353.C`、`Core/Src/PID.c`、`Core/Src/sense.c`、
@@ -875,7 +1198,8 @@ fault_triggered = 1;
 
 - 控制与保护逻辑零改动：删掉的只有诊断输出和两个"只写标量、不参与判定"的 ISR 钩子；
   `fault_recover_blocked()` 的判据、退避计时与 `FOC_STATE_FAULT` 状态机保持原样。
-- 串口不再有 5 ms 事件行与 1 s 周期快照；在线观察改用 `status` / `fault` / `can` 命令与 Keil Watch（`dbg`）。
+- 串口不再有 5 ms 事件行与 1 s 周期快照；在线观察改用 `status` / `fault` / `can` 命令与 Keil Watch
+  (`dbg`；需先取消 `main.c` 中 `DBG_Monitor_Update();` 的注释，否则快照不刷新)。
 - 固件代码（`Core/`）检索确认无 `UartLog` / `UARTLOG_*` / `log_hist*` / `log_rblk*` / `log_vbus*` /
   `[FLT]` / `[EVT]` / `[SNAP]` / `[RBLK]` / `[LED1ST]` 残留。
 
@@ -1031,6 +1355,10 @@ fault_triggered = 1;
 - 如需进一步提高刷新率，可后续单独评估（当前已不占定时器，只剩主循环调度抖动与滤波系数两项限制）；本轮按需求保持 1kHz 节拍、未改滤波系数。
 - 首拍语义：上电后第一次 `KTH7823_UpdateAngle()` 拿到的是 `KTH7823_Init()` 那一帧命令对应的角度（有效，滞后一帧）。
 
+> **注（2026-10-22）**：本条确立的「主循环 1kHz 刷新」方案已被同日「编码器刷新移入 TIM1 20kHz 中断」取代——
+> 快路径（SPI 帧 + 解包裹）改在控制中断内逐拍执行，慢路径（滤波角度）仍留在主循环 1kHz。
+> 因此本节中 `KTH7823_UpdateAngle/UpdateSpeed`、`KTH7823_RAW_FAULT_LIMIT=8` 等描述均为当时状态，以最新条目为准。
+
 **关联文件**：`Core/Inc/kth7823.h`、`Core/Src/KTH7823.c`、`Core/Src/main.c`、`Core/Src/motor_control.c`、`Core/Src/tim.c`、`Core/Inc/tim.h`、`Core/Src/stm32g4xx_it.c`、`Core/Inc/stm32g4xx_it.h`、`Core/Src/uart_cmd.c`、`Core/Inc/Protect.h`、`Core/Src/Protect.c`、`Core/Inc/dbg_monitor.h`。
 
 ### 2026-10-16 — 故障掩码 `fault_mask`：一次故障事件记全所有触发保护 + 失联计时可观测
@@ -1064,8 +1392,8 @@ fault_triggered = 1;
   `silent=<当前节拍>/<COMM_TIMEOUT_TICKS>`~~：这两处输出属于 `UartLog` 自动上报模块，已随该模块
   于 2026-10-20 整体删除；`comm_silent_ticks` 仍在 `Protect` 内部维护，可在 Keil Watch 中查看。
 
-**调试（有意变更）**：`main.c` 主循环的 `DBG_Monitor_Update();` 当前处于**注释**状态
-（Keil Watch 里的 `dbg` 会停留在最后一次刷新的值）；需要时取消注释即恢复每循环刷新。
+**调试（有意变更）**：`main.c` 主循环的 `DBG_Monitor_Update();` 当时处于**注释**状态
+（Keil Watch 里的 `dbg` 会停留在最后一次刷新的值）；**现已于 2026-10-22 恢复为每轮调用**，见上方同日条目。
 
 **关联文件**：`Core/Inc/FOC.H`、`Core/Src/Protect.c`、`Core/Src/main.c`、`Core/Src/uart_cmd.c`、
 `Core/Inc/uart_cmd.h`、`Core/Inc/dbg_monitor.h`、`Core/Src/FOC.C`。

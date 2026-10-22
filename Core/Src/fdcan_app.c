@@ -3,6 +3,7 @@
 #include "DRV8353.h"
 #include "sense.h"
 #include "foc.h"
+#include "kth7823.h"
 #include "Protect.h"
 #include "motor_control.h"   // MotorControl_CommandGate（硬件错误锁死门控）
 #include "math.h"
@@ -32,8 +33,6 @@ extern float manual_voltage;
 // 角度换算常量（不依赖 PI 宏，避免头文件依赖差异）
 #define FD_DEG2RAD   0.01745329252f   // 度 -> rad
 #define FD_RAD2DEG   57.29577951308f  // rad -> 度
-
-extern float KTH7823_Angle_Multiturn;   // 电机轴多圈机械角(未滤波)，与闭环/对齐同源
 
 static FDCAN_TxHeaderTypeDef tx_header;
 static uint8_t tx_data[8];

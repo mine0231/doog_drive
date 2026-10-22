@@ -50,10 +50,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// 注：上电自动执行启动序列已迁移至 motor_control.c（MotorControl_BootSequence）
-
-float manual_voltage = 0.0f;	// 手动给定电压 (V)，默认 0，上电不转（安全）
-float manual_speed = 0.0f;	  // 手动给定速度 (rad/s)，默认 0
 
 volatile uint8_t fault_triggered = 0;	// 驱动故障标志
 volatile uint8_t  fault_code = FAULT_CODE_NONE;  // 故障诊断码（锁存），主循环上报后清零
@@ -78,7 +74,6 @@ volatile uint8_t  fault_status_valid = 0;        // 1=上面两个值是本次 n
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim);
 
 // 驱动故障回调函数
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
@@ -174,7 +169,7 @@ int main(void)
 		FOC_FaultRecoverProcess();
 
 		// 调试监控快照：集中刷新关键运行变量到 dbg，供 KEIL Watch 观察
-//		DBG_Monitor_Update();
+		DBG_Monitor_Update();
 		
 		// 温度更新
 		TempSense_Update();
@@ -260,12 +255,12 @@ int main(void)
 
 		// 处理 CAN 消息（多节点：只处理发给本节点 NODE_ID 的帧，过滤器已按 ID 区分）
     FDCAN_App_Process();
-
-		// 编码器刷新：主循环读角度 + 测速，20kHz 控制中断读到的最旧角度约 1ms
-		KTH7823_UpdateAngle();   // SPI 单帧流水线读角度 -> 异常读数统计 -> 解包裹/野值剔除 -> 滤波 -> 多圈角
-		KTH7823_UpdateSpeed();   // DWT 差分测速（一阶低通）
-		DWT_DelayMs(1);          // 定 1ms 节拍 
 		
+		// 编码器 SPI 刷新已移入 TIM1 20kHz 中断（KTH7823_Tick，SPI1 唯一所有者）；
+		// 主循环只做滤波角度（sin/cos + atan2，约 7µs，按 1kHz 跑，不碰 SPI）
+		KTH7823_SlowUpdate();
+		DWT_DelayMs(1);          // 定 1ms 节拍
+
 		// 喂独立看门狗：主循环 1ms 周期喂狗，远小于 1s 超时
 		HAL_IWDG_Refresh(&hiwdg);
 		 

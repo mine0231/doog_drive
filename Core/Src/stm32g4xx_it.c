@@ -22,11 +22,11 @@
 #include "stm32g4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "motor_control.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN TD */
-extern  uint32_t control_tick;
 /* USER CODE END TD */
 
 /* Private define ------------------------------------------------------------*/
@@ -266,9 +266,15 @@ void DMA1_Channel4_IRQHandler(void)
 void TIM1_UP_TIM16_IRQHandler(void)
 {
   /* USER CODE BEGIN TIM1_UP_TIM16_IRQn 0 */
-
+	if ((TIM1->SR & TIM_SR_UIF) != 0U)
+  {
+		TIM1->SR = ~TIM_SR_UIF;         // 第一时间清 UIF，防咬尾
+		FOC_TIM1_UpdateIRQHandler();
+  }
   /* USER CODE END TIM1_UP_TIM16_IRQn 0 */
-  HAL_TIM_IRQHandler(&htim1);
+  // TIM1 只使能了 UPDATE 中断，且 UIF 已在上面由直连函数清除，HAL 分发没有可处理的事件。
+  // 保留调用每拍要多花约 2.4µs（实测 entry+HAL≈2.8µs），故关闭。
+  // HAL_TIM_IRQHandler(&htim1);
   /* USER CODE BEGIN TIM1_UP_TIM16_IRQn 1 */
 
   /* USER CODE END TIM1_UP_TIM16_IRQn 1 */

@@ -25,6 +25,9 @@ void MotorControl_Init(void);
 // 上电自动执行启动序列
 void MotorControl_BootSequence(void);
 
+// UIF直连函数
+void FOC_TIM1_UpdateIRQHandler(void);
+
 // 控制命令门控：1=放行 0=拒绝（硬件错误锁死后拒绝控制命令，诊断命令不调用本函数）
 uint8_t MotorControl_CommandGate(void);
 

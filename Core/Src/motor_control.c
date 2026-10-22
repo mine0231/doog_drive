@@ -3,6 +3,7 @@
 #include "kth7823.h"
 #include "sense.h"
 #include "foc.h"
+#include "Protect.h"     // Protect_StopPWM（零偏标定失败时统一停三路输出）
 #include "tim.h"
 #include "adc.h"
 #include "stm32g4xx_hal_rcc.h"
@@ -18,19 +19,15 @@
 #define BOOT_SC_RETRY_DELAY_MS 20     // 自检重试之间的短延时(ms)，让驱动/SPI 稳定
 
 
-extern float manual_voltage;   // 手动给定电压 (V)（定义于 main.c）
-extern float manual_speed;     // 手动给定速度 (rad/s)（定义于 main.c）
-
 uint32_t s_tick = 0; // 同一拍内时间戳一致
+float manual_voltage = 0.0f;	// 手动给定电压 (V)，默认 0，上电不转
+float manual_speed = 0.0f;	  // 手动给定速度 (rad/s)，默认 0
+float control_dt = 0.01f;  // 控制周期 (秒)
+volatile uint32_t control_tick = 0;	// 控制节拍计数（中断）
+volatile uint8_t motor_ready = 0;   // 电流偏移校准完成前为 0，禁止中断里跑 FOC/保护
 static uint8_t boot_hw_error = 0;   // 1 = 上电自检三次仍不通过，硬件错误（锁死控制命令，需检修）
 
-volatile uint32_t control_tick = 0;
-float control_dt = 0.01f;  // 控制周期 (秒)，由 MotorControl_Init 按 TIM1 频率计算
-volatile uint8_t motor_ready = 0;   // 电流偏移校准完成前为 0，禁止中断里跑 FOC/保护
-extern volatile float KTH7823_Angle_Rad;
-extern volatile float KTH7823_Speed_Rads;
-
-//电机控制初始化
+// 电机控制初始化
 void MotorControl_Init(void)
 {
     // 计算实际控制周期
@@ -69,14 +66,13 @@ void MotorControl_Init(void)
 		
 		//启动 TIM1 基本计数
 		HAL_TIM_Base_Start_IT(&htim1); 
-
-    // 编码器刷新不占用任何定时器：由 main.c 的 while(1) 每轮调用 KTH7823_UpdateAngle/UpdateSpeed
-    // （1ms 节拍，≈1kHz）。
 		
-    //ADC自校准
-    HAL_ADCEx_Calibration_Start(&hadc1,ADC_DIFFERENTIAL_ENDED);
-		HAL_ADCEx_Calibration_Start(&hadc1,ADC_SINGLE_ENDED);
-    //采样初始化
+    //ADC自校准（本工程 ADC1/ADC2 全部通道均为单端输入）
+    HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+    HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
+    //采样初始化：启动规则组 DMA + 注入组触发器(TIM1_CH4，UEV 前 4µs) + 零偏标定
+    //（此时 TIM1 三路 PWM 未启动，但 DRV8353 已使能：3x PWM 模式下 INH 全低→三相下桥全通，
+    //  转子静止时相电流为 0；标定结果由 CurrentSense_Init 内的零偏校验把关）
     CurrentSense_Init();
 
     //启动 TIM1 PWM
@@ -92,24 +88,28 @@ void MotorControl_Init(void)
 		
 }
 
-//中断回调函数
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+// UIF直连函数
+void FOC_TIM1_UpdateIRQHandler(void)
 {
-    if (htim->Instance == TIM1) {
-			
-		s_tick = HAL_GetTick(); 	// 当前中断时间戳
-			
-    CurrentSense_Update();	
+	  s_tick = HAL_GetTick();       // 本拍时间戳，入口采一次
 
-    // 执行 FOC 算法（电流偏移校准完成前不执行，避免初始化期误触发保护）
+    // 编码器刷新（SPI 单帧流水线，20kHz）：放在最前面，使本拍 FOC 用到最新角度。
+    // 注：单帧协议的返回值对应上一拍命令，固有滞后 1 个控制周期，由 _Comp 外推补偿。
+    KTH7823_Tick(control_tick);
+
+    CurrentSense_Update();
+
+    // 电流偏移校准完成前不执行 FOC，避免初始化期误触发保护
     if (motor_ready) {
-        FOC_Update();					
-				LED_Update();  // LED 状态机
+        FOC_Update();
+        // LED 只是人眼指示，内部按 ms 计时，降频到 1kHz 不影响观感，省下每拍约 1.2µs
+        if ((control_tick % KTH7823_SLOW_DIV) == 0u) {
+            LED_Update();
+        }
     }
 
     control_tick++;
-  }
-}
+}	
 
 
 // 上电自动执行启动序列
@@ -143,10 +143,10 @@ static void Boot_PrintSelfCheck(uint16_t sc)
     if (sc & DRV8353_SC_STATUS2_FAULT)  UART_SendString("[BOOT]   STATUS2 reports fault bits\r\n");
 }
 
-// 控制命令门控（uart_cmd.c / fdcan_app.c 调用）：1=放行 0=拒绝
+// 控制命令门控：1=放行 0=拒绝
 uint8_t MotorControl_CommandGate(void)
 {
-    if (boot_hw_error) {
+    if (boot_hw_error || sense_hw_error) {
         UART_SendString("[DEVICE] ERROR: HARDWARE ERROR - control disabled. Maintenance required.\r\n");
         return 0;
     }
@@ -157,7 +157,10 @@ uint8_t MotorControl_CommandGate(void)
  * 供 FOC.C 的 LED 状态机（20kHz 中断内）读取，避免跨文件访问 static 变量 */
 uint8_t MotorControl_BootIsHwError(void)
 {
-    return boot_hw_error;
+    if (boot_hw_error || sense_hw_error) {
+        return 1;
+    }
+    return 0;
 }
 
 // 上电自动执行启动序列
@@ -212,6 +215,23 @@ void MotorControl_BootSequence(void)
         return;
     }
 
+    // 电流零偏标定超限：与"驱动自检失败"同等对待（不阻塞、锁死控制命令、LED 慢闪）
+    if (sense_hw_error) {
+        manual_voltage    = 0.0f;
+        manual_speed      = 0.0f;
+        foc.target_speed  = 0.0f;
+        foc.target_torque = 0.0f;
+        FOC_SetMode(FOC_STATE_IDLE);   // LED 由 20kHz 中断状态机处理（MotorControl_BootIsHwError=1 → 慢闪）
+
+        // 标定不可信：不要让功率级带电待命（否则三相下桥全通，而电流读数本身带偏置）
+        DRV8353_Disable();
+        Protect_StopPWM();
+
+        UART_SendString("[BOOT] ERROR: current-sense zero offset out of range.\r\n");
+        UART_SendString("===== BOOT SEQUENCE END =====\r\n\r\n");
+        return;
+    }
+
     // 自检通过：停止输出、清零给定，进入 IDLE 等待控制
     manual_voltage    = 0.0f;
     manual_speed      = 0.0f;
@@ -224,4 +244,3 @@ void MotorControl_BootSequence(void)
 		
     UART_SendString("Please send “help” for more information.\r\n\r\n");		
 }
-

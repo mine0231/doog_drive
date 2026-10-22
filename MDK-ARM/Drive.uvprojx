@@ -395,11 +395,6 @@
           <GroupName>Application/User/Core</GroupName>
           <Files>
             <File>
-              <FileName>DRV8353.C</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\DRV8353.C</FilePath>
-            </File>
-            <File>
               <FileName>dwt_delay.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\dwt_delay.c</FilePath>
@@ -410,29 +405,9 @@
               <FilePath>..\Core\Src\fdcan_app.c</FilePath>
             </File>
             <File>
-              <FileName>FOC.C</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\FOC.C</FilePath>
-            </File>
-            <File>
-              <FileName>KTH7823.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\KTH7823.c</FilePath>
-            </File>
-            <File>
               <FileName>motor_control.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\motor_control.c</FilePath>
-            </File>
-            <File>
-              <FileName>PID.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\PID.c</FilePath>
-            </File>
-            <File>
-              <FileName>Protect.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\Protect.c</FilePath>
             </File>
             <File>
               <FileName>sense.c</FileName>
@@ -443,6 +418,11 @@
               <FileName>uart_cmd.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\uart_cmd.c</FilePath>
+            </File>
+            <File>
+              <FileName>kth7823_2.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\kth7823_2.c</FilePath>
             </File>
             <File>
               <FileName>main.c</FileName>
@@ -500,9 +480,29 @@
               <FilePath>../Core/Src/stm32g4xx_hal_msp.c</FilePath>
             </File>
             <File>
-              <FileName>kth7823_2.c</FileName>
+              <FileName>drv8353.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\Core\Src\kth7823_2.c</FilePath>
+              <FilePath>..\Core\Src\drv8353.c</FilePath>
+            </File>
+            <File>
+              <FileName>foc.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\foc.c</FilePath>
+            </File>
+            <File>
+              <FileName>kth7823.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\kth7823.c</FilePath>
+            </File>
+            <File>
+              <FileName>pid.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\pid.c</FilePath>
+            </File>
+            <File>
+              <FileName>protect.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\protect.c</FilePath>
             </File>
           </Files>
         </Group>

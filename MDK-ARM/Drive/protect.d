@@ -1,4 +1,4 @@
-drive/protect.o: ..\Core\Src\Protect.c ..\Core\Inc\Protect.h \
+drive/protect.o: ..\Core\Src\protect.c ..\Core\Inc\Protect.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal.h \
   ..\Core\Inc\stm32g4xx_hal_conf.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_rcc.h \

@@ -41,21 +41,35 @@ void MX_TIM1_Init(void)
 
   /* USER CODE BEGIN TIM1_Init 1 */
 
-  /* 中心对齐 PWM 时序约定（改 ARR / RCR 时必须同步 motor_control.c 的 control_dt）：
-   *   f_pwm = 72MHz / (2*(ARR+1)) = 72e6/(2*3600) = 10 kHz
-   *   RCR=0 -> 更新事件在上溢、下溢各触发一次：
-   *            FOC 更新中断 = 2*f_pwm = 20 kHz，TRGO(=UPDATE) 也是 20 kHz
-   *            => 电流每半周期采一次、占空比每半周期更新一次（双采样/双更新）
-   *   control_dt 应等于 1/20kHz = 50µs
+  /* 中心对齐 PWM / 控制节拍约定（改 ARR / RCR 时必须同步 motor_control.c 的 control_dt）：
+   *   f_pwm = TIM1_clk / (2*(ARR+1)) = 72e6/(2*1800) = 20 kHz（周期 50µs）
+   *   RCR=1 -> 每整个 PWM 周期只产生 1 次更新事件，且落在下溢（谷点 CNT=0）【已实测确认】：
+   *            FOC 更新中断 = 20 kHz，control_dt = 50µs
+   *   TRGO=UPDATE(UEV)：供 ADC1 规则组（rank1=CH4/MOS温度 24.5cyc、rank2=CH8/母线 247.5cyc）
+   *            与 ADC2(NTC) 采慢变量；规则组每次触发固定转换 2 通道，DMA 2 半字循环，索引不会错位。
+   *            CH8 因 100kΩ 串阻需长采样时间（247.5cyc = 6.9µs ≈13.8τ），整组耗时 8.25µs，
+   *            远小于到下一次 CC4 触发的 46µs，不会与注入组抢 ADC。
+   *   CH4 = 电流采样触发源（ADC1 注入组，触发源 T1_CC4 上升沿）：
+   *            中心对齐下 OC4REF 在"下行段经过 CCR4"时产生上升沿（PWM1 模式），
+   *            该时刻距下溢还有 CCR4 个计数 -> CCR4=288 即"UEV 前 4µs"触发。
+   *            注入组 2 通道转换 2×(24.5+12.5)/36MHz = 2.06µs，
+   *            在 UEV 前约 1.94µs 完成，更新中断里读 JDR 即为当拍新样本
+   *            （JEOS 为 w1c，读 JDR 只清 JEOC，必须手动写 1 清 JEOS，见 sense.c）。
+   *   CH4 不占引脚（PA11 仍作 DRV8353 ENABLE），仅作内部触发；CC4E 由
+   *            CurrentSense_Init() 中的 HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4) 打开
+   *            （HAL_TIM_PWM_ConfigChannel 本身不置 CC4E）。
+   *            注意：该函数对 TIM1 会顺带置 MOE（__HAL_TIM_MOE_ENABLE）
+   *   注意：CCR4 只表示"采样提前量(288=4µs)"，与占空比无关；CubeMX 的 Pulse 初值仅作占位，
+   *        实际值由 CurrentSense_Init() 覆写。
    */
 
   /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 0;
   htim1.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED1;
-  htim1.Init.Period = 3599;
+  htim1.Init.Period = 1799;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.RepetitionCounter = 1;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
   {
@@ -78,7 +92,7 @@ void MX_TIM1_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 1800;
+  sConfigOC.Pulse = 900;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
@@ -93,6 +107,11 @@ void MX_TIM1_Init(void)
     Error_Handler();
   }
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.Pulse = 288;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
   {
     Error_Handler();
   }

@@ -12,13 +12,11 @@
 // 过流保护
 extern volatile uint8_t fault_triggered;
 extern volatile uint8_t fault_code;   // 故障诊断码锁存
-extern volatile float KTH7823_Speed_Rads;   // 机械角速度 (rad/s)，超速/堵转检测用
 extern float control_dt;   // 控制周期 (s)，I²t 累积用
 
 //编码器读数有效性（断线/无磁）监测
 volatile uint16_t encoder_stall_max = 0; // 记录观察到的最大连续异常读数次数（诊断用）
-static uint8_t  enc_armed = 0; // 监测是否准备标志位
-static uint32_t enc_arm_tick = 0; // 记录监测起始点
+static uint8_t encoder_fault_latched = 0;
 
 // 上位机通讯心跳（CAN）：每收到一帧 Protect_CommFeed 递增一次
 volatile uint32_t comm_rx_count = 0;    // 通讯心跳计数
@@ -70,38 +68,26 @@ void Protect_StallCheck(void)
     }
 }
 
-// 编码器读数有效性/断线监测
-// 原理：KTH7823 的 SPI 读取由主循环（≈1kHz）刷新，读到 0x0000/0xFFFF 视为
-//       断线/无磁等无效读数，由 KTH7823_UpdateAngle 累计到 kth7823_raw_fault_cnt
-//       （正常读数立即清零）。本函数在控制中断（20kHz，50µs/拍）内调用，连续异常
-//       读数达到 KTH7823_RAW_FAULT_LIMIT 即判定编码器失效，触发硬件保护。
-// 注：主循环存活由 IWDG 单独保障，此处只判读数有效性、不判刷新节奏。
+// 编码器读数新鲜度保护：SPI 失败、无效 raw 或被拒绝的解包裹野值均不刷新 stale_ticks。
+// 100 个 20kHz 周期（约 5ms）未接受到有效样本即停机；计数从采样启动即开始，
+// 因此首次有效样本迟迟未到也会触发，不依赖采样心跳来武装保护。
 void Protect_EncoderStallCheck(void)
 {
-    // ---- 准备阶段：等主循环开始刷新编码器，再观察 ARM_DELAY 后才开始监测 ----
-    if (!enc_armed) {
-        if (encoder_update_count != 0) {                 // 编码器已在主循环内刷新
-            if (enc_arm_tick == 0) enc_arm_tick = s_tick;  // 记录起始点
-            else if (s_tick - enc_arm_tick > ENCODER_ARM_DELAY_MS) {
-                enc_armed = 1;   // 过了延时，开始监测
-            }
-        } else {
-            enc_arm_tick = 0;                            // 还没刷新，计时作废
-        }
+    if (kth7823_stale_ticks < KTH7823_STALE_TICK_LIMIT) {
+        encoder_fault_latched = 0;
         return;
     }
 
     // 记录观察到的最大连续异常读数次数（诊断用）
     if (kth7823_raw_fault_cnt > encoder_stall_max) encoder_stall_max = kth7823_raw_fault_cnt;
 
-    if (kth7823_raw_fault_cnt >= KTH7823_RAW_FAULT_LIMIT) {   // 连续无效读数达阈值：判定编码器断线/无磁
-        fault_code = FAULT_CODE_ENCODER_STALL;  // 锁存软件故障码
-        DRV8353_Disable();
-        Protect_StopPWM();
-        fault_triggered = 1;   // 交由 FOC_Update 顶部的 FOC_STATE_FAULT 状态机退避恢复
-        enc_armed = 0;      // 触发后重新准备
-        enc_arm_tick = 0;
-    }
+    if (encoder_fault_latched) return;
+
+    encoder_fault_latched = 1;
+    fault_code = FAULT_CODE_ENCODER_STALL;
+    DRV8353_Disable();
+    Protect_StopPWM();
+    fault_triggered = 1;
 }
 
 // 上位机通讯心跳喂狗：CAN 每收到一帧数据调用一次（在接收中断内）
@@ -295,11 +281,20 @@ void Protect_I2tCheck(void)
 // 保护巡检
 void Protect_FOC(void)
 {
-	// 上位机通讯失联监测：CAN 心跳超时则触发保护
-	Protect_CommTimeoutCheck();
+	// 单相瞬时峰值过流：捕获不对称尖峰/短路
+	Protect_PhasePeakCheck();
 	// 检测堵转电流
 	Protect_StallCheck();
-	// 编码器读数有效性/断线监测：连续无效读数(0x0000/0xFFFF)则触发保护
+	// I²t 热积累保护：防持续过流烧电机
+	Protect_I2tCheck();
+	
+	if (control_tick % 10u != 0u) return;		//缓保护降频
+	
+	// 位置跟随误差
+	Protect_PositionErrorCheck();
+	// 软限位保护
+	Protect_SoftLimitCheck();
+	// 编码器新鲜度监测：连续没有接受到有效样本则触发保护
 	Protect_EncoderStallCheck();
 	// 过温保护：线圈温度超关断阈值则触发保护
 	Protect_OvertempCheck();
@@ -307,9 +302,7 @@ void Protect_FOC(void)
 	Protect_BusVoltageCheck();
 	// 超速保护：机械角速度超阈值停机（防飞车）
 	Protect_OverspeedCheck();
-	// 单相瞬时峰值过流：捕获不对称尖峰/短路
-	Protect_PhasePeakCheck();
-	// I²t 热积累保护：防持续过流烧电机
-	Protect_I2tCheck();
+	// 上位机通讯失联监测：CAN 心跳超时则触发保护
+	Protect_CommTimeoutCheck();
 }
 	

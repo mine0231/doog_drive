@@ -19,10 +19,6 @@
 extern float manual_voltage;	
 extern float manual_speed;
 extern float control_dt;               
-extern float KTH7823_Angle_Deg;
-extern volatile float KTH7823_Angle_Rad;
-extern volatile float KTH7823_Speed_Rads;
-extern float KTH7823_Speed_RPM;
 
 #define UART_RX_BUF_SIZE  64
 #define UART_RX_DMA_SIZE  256u                    // RX DMA 循环缓冲，必须是 2 的幂
@@ -70,6 +66,7 @@ static const char* help_msg =
     "status         - Print current status (Mode uses mode= numbering: 6=FAULT)\r\n"
     "can            - Print CAN(FDCAN2) live diagnostics (state/errors/RX/TX/last frame)\r\n"
     "log=<0|1>      - Auto report realtime status every 200ms (Ia/Ib/Ic, Vbus, temp, speed, mode)\r\n"
+
     "pid            - Print all PID gains (Kp/Ki/Kd)\r\n"
     "pid <ring> <Kp> <Ki> <Kd> - Set PID (ring: speed|id|iq|pos)\r\n"
     "enable         - Enable DRV8353 output\r\n"
@@ -176,7 +173,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 #define TEST_OL_TWO_PI              6.283185307f
 
 extern volatile uint32_t control_tick;      // 控制节拍计数（motor_control.c 定义，20kHz）
-extern float KTH7823_Angle_Multiturn;       // 电机轴多圈机械角(未滤波)，与闭环/对齐同源
+
 
 static char ol_msg[96];                     // 保持阶段回显缓冲（静态区：主栈仅 1KB，不可重入）
 
@@ -219,11 +216,8 @@ static void UART_Test_OpenLoopHold(float hold_vol)
     UART_SendString("Hold on (electric spring)...\r\n");
 
     while ((HAL_GetTick() - t_hold) < TEST_OL_HOLD_MS) {
-        // 阻塞期间必须维持的节奏：编码器刷新 + 喂狗 + 发串口。
-        // 刷新已收敛到主循环，本函数阻塞期间主循环不跑，必须自己刷新，
-        // 否则下面的 dev 用到的角度是冻结值（回拉会失效）。
-        KTH7823_UpdateAngle();
-        KTH7823_UpdateSpeed();
+        // 阻塞期间保持喂狗 + 发串口即可：编码器刷新已移入 20kHz 中断，
+        // 下面的 dev 用到的多圈角持续更新（不再需要自己发起 SPI 帧）。
         UART_Tx_Poll();
         HAL_IWDG_Refresh(&hiwdg);
 
@@ -240,9 +234,7 @@ static void UART_Test_OpenLoopHold(float hold_vol)
 
             uint32_t t_pull = HAL_GetTick();
             while ((HAL_GetTick() - t_pull) < TEST_OL_HOLD_PULL_TIMEOUT_MS) {
-                // 阻塞期间自己刷新编码器（主循环不跑），再喂狗/发串口
-                KTH7823_UpdateAngle();
-                KTH7823_UpdateSpeed();
+                // 阻塞期间喂狗 + 发串口；角度由 20kHz 中断持续刷新
                 UART_Tx_Poll();
                 HAL_IWDG_Refresh(&hiwdg);
 
@@ -316,10 +308,7 @@ int UART_Test_OpenLoopMoveAngle(float out_deg)
         last_tick = now;
         moved += foc.target_speed_ramp * (float)MOTOR_POLE_PAIRS * control_dt * (float)dt_ticks;
 
-        // 阻塞期间自己刷新编码器（主循环不跑）：开环不用其值判位，但要维持角度/测速连续，
-        // 避免运动结束后 hold 阶段拿到过期角度。
-        KTH7823_UpdateAngle();
-        KTH7823_UpdateSpeed();
+        // 阻塞期间喂狗 + 发串口；角度/测速由 20kHz 中断维持，运动结束后 hold 阶段拿到的仍是新值
         UART_Tx_Poll();
         HAL_IWDG_Refresh(&hiwdg);  // 阻塞期间喂狗，防 IWDG 复位
         if ((HAL_GetTick() - t0) > TEST_OL_MOVE_TIMEOUT_MS) break;
@@ -491,22 +480,24 @@ void UART_Cmd_Process(void)
                 "Speed=%.2f rad/s (%.2f RPM) | Angle=%.2f deg\r\n"
                 "Ia=%.3f A, Ib=%.3f A, Ic=%.3f A\r\n"
                 "Id=%.3f A, Iq=%.3f A | Mode=%d\r\n"
-                "TargetSpeed=%.2f rad/s | Voltage=%.2f V | V_Bus=%.2f V\r\n"
+                "TargetSpeed=%.2f rad/s | Voltage=%.2f V | V_Bus=%.2f V\r\n | NTC_Temp=%.2f ℃\r\n "
                 "Align: offset=%.4f rad (%.2f deg) | dir=%+d\r\n"
-                "ADC_A=%u(%.3fV) ADC_B=%u(%.3fV) | TXdrop=%lu (send buffer full, dropped msgs)\r\n",
+                "ADC_A=%u(%.3fV) ADC_B=%u(%.3fV) | InjMiss=%lu | TXdrop=%lu\r\n",
                 KTH7823_Speed_Rads, KTH7823_Speed_RPM,
                 KTH7823_Angle_Deg,
                 current_A, current_B, current_C,
                 foc.Id, foc.Iq, (int)foc.mode,
-                foc.target_speed, manual_voltage, bus_voltage,
+                foc.target_speed, manual_voltage, bus_voltage,ntc_temperature,	
                 encoder_offset, encoder_offset * 57.2957795f, encoder_direction,
-                adc_values[0], (float)adc_values[0] / 4095.0f * 3.3f,
-                adc_values[1], (float)adc_values[1] / 4095.0f * 3.3f,
+                adc1_values_inj[0], (float)adc1_values_inj[0] / 4095.0f * 3.3f,
+                adc1_values_inj[1], (float)adc1_values_inj[1] / 4095.0f * 3.3f,
+                (unsigned long)adc_inj_miss_cnt,
                 (unsigned long)UART_TxDropCount());
         UART_SendString(response);
         return;
     }
-    
+
+
     // ==================== PID 在线调参 ====================
     //
     // 功能：通过串口在电机运行时实时查看/修改 4 个 PID 环的比例、积分、微分系数。
@@ -854,14 +845,16 @@ void UART_SendStatus(void)
 
     char buf[192];
     sprintf(buf,
-            "Ia=%+.2f Ib=%+.2f Ic=%+.2f A | Vbus=%.1f V | T=%.1f C | S=%.1f rad/s | Mode=%d | ADC_A=%u ADC_B=%u\r\n",
+            "Ia=%+.2f Ib=%+.2f Ic=%+.2f A | Vbus=%.1f V | T=%.1f C | S=%.1f rad/s | Mode=%d | ADC_A=%u ADC_B=%u | Miss=%lu\r\n",
             current_A, current_B, current_C,
             bus_voltage,
             ntc_temperature,
             KTH7823_Speed_Rads,
             (int)foc.mode,
-            adc_values[0], adc_values[1]);
+            adc1_values_inj[0], adc1_values_inj[1],
+            (unsigned long)adc_inj_miss_cnt);
     UART_SendString(buf);
+
 }
 
 // 自动停止
