@@ -1,10 +1,10 @@
 #include "uart_cmd.h"
 #include "usart.h"
-#include "DRV8353.h"
+#include "drv8353.h"
 #include "foc.h"
 #include "sense.h"
 #include "kth7823.h"
-#include "Protect.h"
+#include "protect.h"
 #include "fdcan_app.h"  
 #include "fdcan.h"       // hfdcan2（串口 can 诊断命令读外设状态/错误计数）
 #include "dwt_delay.h"   // [TEST] DWT_DelayMs（开环角度运动阻塞延时）
@@ -15,10 +15,6 @@
 #include <stdlib.h>
 #include <math.h>    // fabsf（对齐结果自检用）
 
-//外部变量
-extern float manual_voltage;	
-extern float manual_speed;
-extern float control_dt;               
 
 #define UART_RX_BUF_SIZE  64
 #define UART_RX_DMA_SIZE  256u                    // RX DMA 循环缓冲，必须是 2 的幂
@@ -30,6 +26,12 @@ extern float control_dt;
 
 // 开环点动自动归零：输入 v= 后启动计时
 #define AUTO_STOP_MS  3000   // 自动归零延时 (ms)
+
+// 内部变量
+// 本次故障事件已通过串口打印过的故障码（去重用）。
+// 故障码不再由串口上报清零（CAN 模式下串口上报不执行，清零会导致故障码永远清不掉），
+// 改由 FOC_SetMode() 离开 FAULT 态时统一清除；串口侧靠本标志防止重复刷屏。
+static uint8_t uart_fault_reported_code = FAULT_CODE_NONE;
 
 static  uint8_t rx_dma_buf[UART_RX_DMA_SIZE];    // DMA 循环写入的接收缓冲
 static  volatile uint16_t rx_dma_pos = 0;        // 已消费到的位置（0..UART_RX_DMA_SIZE）
@@ -420,11 +422,28 @@ static int UART_IsControlCmd(const char* c)
             strcmp (c, "enable")   == 0);
 }
 
+// CAN 工作期间调用：丢弃已收到的串口数据，只丢弃、不执行、不回显
+void UART_Cmd_Discard(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    cmd_ready   = 0;
+    rx_index    = 0;
+    rx_overflow = 0;
+    // 把消费位置对齐到 DMA 当前写入位置，连同 DMA 里未消费的字节一起丢掉
+    rx_dma_pos  = (uint16_t)((UART_RX_DMA_SIZE -
+                              __HAL_DMA_GET_COUNTER(huart3.hdmarx)) & UART_RX_DMA_MASK);
+    __set_PRIMASK(primask);
+}
+
 //解析并执行命令（在主循环中调用）
 void UART_Cmd_Process(void)
 {
     if (!cmd_ready) return;
-
+		if (Protect_CommIsArmed()) {   // 双保险：CAN 已工作则丢弃并返回
+			UART_Cmd_Discard();
+			return;
+    }
     // 取出完整命令行：cmd_ready=1 期间中断不会改写 cmd_line，故先整体拷出、再清标志，
     // 命令行既不会被撕开，也不与中断争 rx_buf（主循环不再触碰接收缓冲、不再挂接收中断）。
     // 静态区：主栈仅 1KB，且本函数只在主循环调用、不可重入。
@@ -978,4 +997,78 @@ void UART_PrintSystemReport(void)
     UART_SendString(buf);
 
     UART_SendString("===== END PARAM CHECK =====\r\n");
+}
+
+// 故障信息串口上报
+void UART_FaultReport(void){
+	
+	// 无故障（含故障恢复后）：复位去重标志，使下一次故障事件能再次上报
+	if (fault_code == FAULT_CODE_NONE) {
+		uart_fault_reported_code = FAULT_CODE_NONE;
+		return;
+	}
+
+	// 同一故障码在本次故障事件内只打印一次：保护在故障持续期间会每拍重设 fault_code
+	if (fault_code == uart_fault_reported_code) return;
+	uart_fault_reported_code = fault_code;
+
+	// 有故障：按类型逐条打印（fault_code 已由上面的守卫保证非 0）
+	if (fault_code != FAULT_CODE_NONE) {
+      // 硬件故障：上报 Disable 前锁存的 STATUS1/2；软件故障：上报软件码
+      uint16_t status1 = fault_status1;
+      uint16_t status2 = fault_status2;
+      if (fault_code == FAULT_CODE_STALL) {
+          UART_SendString("FAULT: STALL\r\n");// 软件堵转/过流
+      } else if (fault_code == FAULT_CODE_ENCODER_STALL) {
+          UART_SendString("FAULT: ENCODER_STALL\r\n");// 编码器失速/断线
+      } else if (fault_code == FAULT_CODE_OVERTEMP) {
+          UART_SendString("FAULT: OVERTEMP\r\n");// MOSFET/线圈过温关断
+      } else if (fault_code == FAULT_CODE_OVERVOLT) {
+          UART_SendString("FAULT: OVERVOLT\r\n");// 母线过压（回馈泵升）
+      } else if (fault_code == FAULT_CODE_UNDERVOLT) {
+          UART_SendString("FAULT: UNDERVOLT\r\n");// 母线欠压
+      } else if (fault_code == FAULT_CODE_OVERSPEED) {
+          UART_SendString("FAULT: OVERSPEED\r\n");// 机械超速
+      } else if (fault_code == FAULT_CODE_PHASE_OC) {
+          UART_SendString("FAULT: PHASE_OC\r\n");// 单相瞬时峰值过流
+      } else if (fault_code == FAULT_CODE_I2T) {
+          UART_SendString("FAULT: I2T\r\n");// I²t 热积累过流
+      } else if (fault_code == FAULT_CODE_POS_ERROR) {
+          UART_SendString("FAULT: POS_ERROR\r\n");// 位置跟随误差
+      } else if (fault_code == FAULT_CODE_SOFT_LIMIT) {
+          UART_SendString("FAULT: SOFT_LIMIT\r\n");// 软限位持续被撞
+      } else if (fault_code == FAULT_CODE_COMM_TIMEOUT) {
+          UART_SendString("FAULT: COMM_TIMEOUT\r\n");// 上位机通讯失联（CAN 心跳超时）
+      } else {
+				if(!fault_status_valid){
+					UART_SendString("FAULT: HW (STATUS unavailable: SPI busy at nFAULT)\r\n");
+				} else {
+				if (status1 & 0x0400) UART_SendString("FAULT: FAULT\r\n");// 故障状态，对应nFault
+				if (status1 & 0x0200) UART_SendString("FAULT: VDS_OCP\r\n");// VDS监视器过流
+				if (status1 & 0x0100) UART_SendString("FAULT: GDF\r\n");// 栅极驱动故障
+				if (status1 & 0x0080) UART_SendString("FAULT: UVLO\r\n");// 欠压锁定
+				if (status1 & 0x0040) UART_SendString("FAULT: OTSD\r\n");// 过温关断
+				if (status1 & 0x0020) UART_SendString("FAULT: VDS_HA\r\n");// A 相高侧VDS过流
+				if (status1 & 0x0010) UART_SendString("FAULT: VDS_LA\r\n");// A 相低侧VDS过流
+				if (status1 & 0x0008) UART_SendString("FAULT: VDS_HB\r\n");// B 相高侧VDS过流
+				if (status1 & 0x0004) UART_SendString("FAULT: VDS_LB\r\n");// B 相低侧VDS过流
+				if (status1 & 0x0002) UART_SendString("FAULT: VDS_HC\r\n");// C 相高侧VDS过流
+				if (status1 & 0x0001) UART_SendString("FAULT: VDS_LC\r\n");// C 相低侧VDS过流
+
+				// STATUS2：逐相/子系统细分诊断（只读）
+				if (status2 & 0x0400) UART_SendString("FAULT: SA_OC\r\n");// A 相电流采样放大器（CSA）过流
+				if (status2 & 0x0200) UART_SendString("FAULT: SB_OC\r\n");// B 相 CSA 过流
+				if (status2 & 0x0100) UART_SendString("FAULT: SC_OC\r\n");// C 相 CSA 过流
+				if (status2 & 0x0080) UART_SendString("FAULT: OTW\r\n");// 过温警告
+				if (status2 & 0x0040) UART_SendString("FAULT: GDUV\r\n");// 电荷泵 VCP / VGLS 欠压故障
+				if (status2 & 0x0020) UART_SendString("FAULT: VGS_HA\r\n");// A 相高侧 MOSFET 栅源（VGS）驱动故障
+				if (status2 & 0x0010) UART_SendString("FAULT: VGS_LA\r\n");// A 相低侧 MOSFET VGS 驱动故障
+				if (status2 & 0x0008) UART_SendString("FAULT: VGS_HB\r\n");// B 相高侧 MOSFET VGS 驱动故障
+				if (status2 & 0x0004) UART_SendString("FAULT: VGS_LB\r\n");// B 相低侧 MOSFET VGS 驱动故障
+				if (status2 & 0x0002) UART_SendString("FAULT: VGS_HC\r\n");// C 相高侧 MOSFET VGS 驱动故障
+				if (status2 & 0x0001) UART_SendString("FAULT: VGS_LC\r\n");// C 相低侧 MOSFET VGS 驱动故障
+				}
+			}	
+      UART_PrintFaultMask(fault_mask, fault_code);
+		}
 }

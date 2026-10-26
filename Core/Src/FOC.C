@@ -23,25 +23,20 @@ float encoder_offset = 0.0f;    // 编码器零点偏移（机械角度）
 float mechanical_angle;		//转子机械角度
 int8_t encoder_direction = 1;  // 编码器方向：1=正转增加，-1=正转减少
 
-static AlignStep_t align_step = ALIGN_STEP_0;   // 对齐步骤状态
-static uint32_t align_step_time = 0;    // 对齐步骤计时器
-static float start_angle_raw, end_angle_raw;    // 对齐起始/结束角度
-static float delta_angle = 0;		//变化角度
-
 // 对齐结果上报：控制中断（20kHz，50µs/拍）里只存数值 + 置标志，
 volatile uint8_t align_report_pending   = 0;    // 1 = 有新的对齐结果待上报
 volatile float   align_report_offset    = 0.0f; // 本次得到的零点偏移 (rad)
 volatile float   align_report_delta     = 0.0f; // 本次测得的角度变化 (rad)
 volatile int8_t  align_report_direction = 1;    // 本次得到的方向 (+1/-1)
 volatile uint32_t align_report_samples  = 0;    // 本次窗口平均用到的样点数（诊断用）
-
 volatile uint8_t arrive_report_pending = 0;   // 转动到位事件：待主循环主动上报
-
 volatile uint32_t led_blink_tick = 0;    // LED 闪烁计时基准(ms)，进入 FAULT 时重置
-extern float control_dt;       // 控制周期 (秒)
-extern volatile float bus_voltage;			//母线电压采样
-extern volatile uint8_t fault_triggered;	
-extern volatile uint32_t control_tick;   // 控制节拍计数
+
+// 内部变量
+static AlignStep_t align_step = ALIGN_STEP_0;   // 对齐步骤状态
+static uint32_t align_step_time = 0;    // 对齐步骤计时器
+static float start_angle_raw, end_angle_raw;    // 对齐起始/结束角度
+static float delta_angle = 0;		//变化角度
 
 // 开环"转到指定输出端角度 + 到位悬停保持"状态机私有量
 static float    ol_hold_voltage = 0.0f;   // 本次动作的悬停/回拉电压 (V)，启动时已按上限限幅
@@ -491,7 +486,8 @@ static uint32_t fault_backoff_delay(uint8_t retry_cnt)
 //   retval 0 = 温度/母线电压/转速/I²t/编码器新鲜度条件全部满足，允许恢复
 static uint8_t fault_recover_blocked(uint32_t *recheck_delay)
 {
-	if (ntc_temperature > OVERTEMP_RECOVER) {
+	if (ntc_temperature > OVERTEMP_RECOVER || 
+		mos_temperature > OVERTEMP_RECOVER) {
 		*recheck_delay = OVERTEMP_RECHECK_DELAY;
 		return 1;
 	}
@@ -511,6 +507,11 @@ static uint8_t fault_recover_blocked(uint32_t *recheck_delay)
 	if (kth7823_stale_ticks >= KTH7823_STALE_TICK_LIMIT) {
 		*recheck_delay = ENCODER_RECHECK_DELAY_MS;
 		return 1;
+	}
+	if ((fault_mask & FAULT_MASK_BIT(FAULT_CODE_COMM_TIMEOUT)) &&
+	    !Protect_CommFrameSeen()) {
+		*recheck_delay = 100;   // 通讯未恢复，100ms 后复检
+		return 1; 
 	}
 	return 0;
 }
@@ -602,6 +603,7 @@ void FOC_Update(void)
 			TIM1->CCR1 = 0;
 			TIM1->CCR2 = 0;
 			TIM1->CCR3 = 0;
+			Protect_FOC();
 			return;  // 跳过后续 SVPWM/占空比更新，保持 PWM 输出为 0
             
 		case FOC_STATE_ALIGN:// 对齐模式：将转子拉到固定位置（0° 和 90°）
@@ -739,17 +741,25 @@ void FOC_Update(void)
 
 			if (foc.fault_recover_state == FOC_RECOVER_DONE) {
 				// 主循环已完成 DRV8353_Recover()（清故障 + 重写配置 + 使能 + 重启三路 PWM），
-				// 由中断统一完成模式收尾：切回开环（统一斜坡缓启动，不会瞬间满电流）。
-				// 放在中断侧是为了让 foc.mode 的状态迁移只发生在单一上下文，避免与故障拦截互相覆盖。
+				// 由中断统一完成模式收尾：切回空闲（统一斜坡缓启动，不会瞬间满电流）
+				// 放在中断侧是为了让 foc.mode 的状态迁移只发生在单一上下文，避免与故障拦截互相覆盖
 				foc.fault_recover_state = FOC_RECOVER_IDLE;
-				FOC_SetMode(FOC_STATE_OPENLOOP);
+				FOC_SetMode(FOC_STATE_IDLE);
+				foc.target_speed = 0.0f;
+				foc.target_speed_ramp = 0.0f;
+				foc.openloop_voltage = 0.0f;
 				// 记录恢复时刻：此处刻意取"此刻"（HAL_GetTick）而非本拍快照 s_tick，
 				// 用途是与 16s 稳定窗口（FAULT_RETRY_DELAY_MAX）比较，1ms 误差无影响。
 				foc.last_recover_tick = HAL_GetTick();
-				Run_ON();
-				return;  // 本拍不调制，下一拍起按开环正常输出
+				Run_OFF();
+				return;  // 不调制，直接回到空闲状态
 			}
 
+			// FAULT 期间让 I²t 自然冷却
+			i2t_accum -= I2T_NOMINAL_CURRENT * I2T_NOMINAL_CURRENT * control_dt;  /* 输出已关，按纯散热衰减 */
+			if (i2t_accum < 0.0f) i2t_accum = 0.0f;
+			
+			// 倒计时判定
 			if (foc.fault_recover_state == FOC_RECOVER_IDLE &&
 			   s_tick >= foc.fault_recover_time) {
 				uint32_t recheck = 0;
@@ -813,8 +823,7 @@ void FOC_FaultRecoverProcess(void)
 {
 	if (foc.fault_recover_state != FOC_RECOVER_REQ) return;
 
-	// 复检（与中断内同一套判据）：从"中断判定可恢复"到本函数执行之间又过了若干毫秒，
-	// 温度/母线电压/转速/I²t 任一超限则作废请求，交回中断重新计时。
+	// 温度/母线电压/转速/I²t 任一超限则作废请求，交回中断重新计时
 	uint32_t recheck = 0;
 	if (fault_recover_blocked(&recheck)) {
 		foc.fault_recover_state = FOC_RECOVER_IDLE;
@@ -832,7 +841,7 @@ void FOC_FaultRecoverProcess(void)
 		return;
 	}
 
-	// 硬件恢复完成：置 DONE，交回中断做模式收尾（切回开环 + 记录 last_recover_tick + Run_ON）
+	// 硬件恢复完成：置 DONE，交回中断做模式收尾（切回空闲 + 记录 last_recover_tick + Run_ON）
 	foc.fault_recover_state = FOC_RECOVER_DONE;
 }
 
@@ -853,7 +862,14 @@ void FOC_SetMode(FOC_State_t mode)
 	if (foc.fault_recover_state == FOC_RECOVER_REQ) {
 		foc.fault_recover_state = FOC_RECOVER_IDLE;
 	}
-
+	
+	// 离开故障态 = 本次故障事件结束：统一在此清除故障锁存（唯一清零点）
+	if (foc.mode == FOC_STATE_FAULT && mode != FOC_STATE_FAULT && !fault_triggered) {
+		fault_code         = FAULT_CODE_NONE;
+		fault_mask         = 0;
+		fault_status_valid = 0;   // 旧的 STATUS1/2 已不代表当前硬件状态，标记失效
+	}
+	
 	if (foc.mode == mode) return;
 
 	// 重置所有 PID 积分，避免模式切换时输出突变

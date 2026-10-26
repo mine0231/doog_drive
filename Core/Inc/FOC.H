@@ -29,7 +29,7 @@
 #define FOC_RECOVER_IDLE 0   // 无恢复动作
 #define FOC_RECOVER_REQ  1   // 中断已判定可恢复，等主循环执行 DRV8353_Recover()
 #define FOC_RECOVER_BUSY 2   // 主循环正在执行阻塞式 DRV8353_Recover()
-#define FOC_RECOVER_DONE 3   // 主循环已完成硬件恢复，等中断切回开环并收尾
+#define FOC_RECOVER_DONE 3   // 主循环已完成硬件恢复，等中断切回空闲并收尾
 
 // 故障诊断码（主循环上报用）：0=无故障，其余为已触发并锁存的故障类型
 #define FAULT_CODE_NONE          0
@@ -73,6 +73,7 @@
 #define FOC_OL_RAD2DEG              57.29577951308f  // rad -> 度
 #define FOC_OL_TWO_PI               6.28318530718f   // 2π
 #define FOC_OL_INV_TWO_PI 					(1.0f / 6.28318530718f)
+#define TORQUE_MAX_IQ   14.0f
 
 // FOC状态机：枚举值即对外统一模式编号（0..6）
 typedef enum {
@@ -102,8 +103,6 @@ extern volatile uint8_t arrive_report_pending;
 //   原 45A 会算出 i_mag = √1.5×45 = 55A，既超 STALL_CURRENT_LIMIT(45A)，又正好顶到
 //   单相峰值阈值 55A，低速/堵转时必触发保护。限到 14A 后：
 //   i_mag = 17.1A < 45A（不触发堵转）、I_rms = 9.9A < 14A（不累积 I²t），可连续运行。
-#define TORQUE_MAX_IQ   14.0f
-
 
 // FOC 状态
 typedef struct {
@@ -174,10 +173,14 @@ extern PID_Handle_t pid_iq;        // q 轴电流环 PID
 extern PID_Handle_t pid_position;  // 位置环 PID
 
 // 故障诊断锁存变量（定义于 main.c）
-extern volatile uint8_t  fault_code;      // 当前故障码，主循环上报后清零
+// 清零点只有一个：FOC_SetMode() 离开 FAULT 态时（故障恢复切 IDLE，或被强制切换模式）。
+// 故障持续期间这两个值保持有效，CAN 0x10 查询据此上报；串口上报只读、不清。
+extern volatile uint8_t  fault_code;      // 当前故障码（lock 到故障结束）
 extern volatile uint16_t fault_mask;      // 本次故障事件内触发过的所有保护位（bit=FAULT_CODE_n）
 extern volatile uint16_t fault_status1;   // 硬件故障 STATUS1 锁存（Disable 前读取）
 extern volatile uint16_t fault_status2;   // 硬件故障 STATUS2 锁存
+extern volatile uint8_t  fault_status_valid;  // 1=STATUS1/2 是本次 nFAULT 读到的，可信
+extern volatile uint8_t fault_triggered;		// 驱动故障标志
 
 // 软限位/位置误差阈值（定义于 Protect.c）
 extern float soft_limit_min;

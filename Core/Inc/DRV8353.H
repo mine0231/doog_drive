@@ -1,5 +1,5 @@
-#ifndef drv8353_H
-#define drv8353_H
+#ifndef __DRV8353_H
+#define __DRV8353_H
 #include "stm32g4xx_hal.h"
 
 // DRV8353 PWM 控制脚 (PB12)
@@ -91,9 +91,9 @@ typedef struct {
 extern DRV8353_SelfCheck_Report_t drv8353_selfcheck;   // 最近一次自检读回快照
 
 // 函数声明	
+uint16_t DRV8353_ReadReg(uint8_t reg);
 void DRV8353_Init(void);
 void DRV8353_WriteReg(uint8_t reg, uint16_t data);
-uint16_t DRV8353_ReadReg(uint8_t reg);
 void DRV8353_ClearFault(void);
 void DRV8353_Recover(void);
 

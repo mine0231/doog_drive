@@ -3,54 +3,35 @@
 #include "arm_math.h"
 #include "spi.h"
 #include "dwt_delay.h"   // DWT_DelayMs
-
-extern float control_dt;   // 控制周期 (s)，motor_control.c 定义
+#include "motor_control.h" 
 
 // 全局变量
-volatile float KTH7823_Angle_Rad = 0.0f;	// 单圈角度 [0, 2π)（慢路径，滤波后）
 float KTH7823_Angle_Deg        = 0.0f;	// 当前角度（度）
+volatile float KTH7823_Angle_Rad = 0.0f;	// 单圈角度 [0, 2π)（慢路径，滤波后）
 volatile float KTH7823_Angle_Multiturn  = 0.0f;	// 多圈总角度（连续无界，弧度，未滤波）
 volatile float KTH7823_Angle_Multiturn_Comp = 0.0f;	// 一拍延迟补偿后的多圈角度（闭环角度源）
 volatile float KTH7823_Speed_RPM        = 0.0f;	// 当前速度（RPM）
 volatile float KTH7823_Speed_Rads = 0.0f;	// 当前速度（rad/s）
-
-// 刷新心跳计数器：慢路径(1kHz)每拍 +1，供失速/断线监测判断编码器是否在刷新
-volatile uint32_t encoder_update_count = 0;
-
-// 连续异常读数（0x0000/0xFFFF）计数：正常 raw 清零，诊断用
-volatile uint16_t kth7823_raw_fault_cnt = 0;
-
-// 距离最近一次接受有效角度样本的控制周期数；通信/raw/解包裹异常均不刷新
-volatile uint16_t kth7823_stale_ticks = 0;
-
-// 被丢弃的解包裹野值累计次数（诊断用，只增不清零；正常应保持 0 或偶发）
-volatile uint16_t kth7823_unwrap_glitch_cnt = 0;
-
-// SPI 帧失败（超时 / 重入被拒）累计次数（诊断用）
-volatile uint16_t kth7823_spi_err_cnt = 0;
-
-// 失败帧的现场快照（[TEMP] 诊断用：确认是 SPE 未开、TXE 不置位还是 RXNE 不来）
-volatile uint32_t kth7823_diag_cr1 = 0;
+volatile uint32_t encoder_update_count = 0;	// 刷新心跳计数器：慢路径(1kHz)每拍 +1，供失速/断线监测判断编码器是否在刷新
+volatile uint16_t kth7823_raw_fault_cnt = 0;	// 连续异常读数（0x0000/0xFFFF）计数：正常 raw 清零，诊断用
+volatile uint16_t kth7823_stale_ticks = 0;	// 距离最近一次接受有效角度样本的控制周期数；通信/raw/解包裹异常均不刷新
+volatile uint16_t kth7823_unwrap_glitch_cnt = 0;	// 被丢弃的解包裹野值累计次数（诊断用，只增不清零；正常应保持 0 或偶发）
+volatile uint16_t kth7823_spi_err_cnt = 0;	// SPI 帧失败（超时 / 重入被拒）累计次数（诊断用）
+volatile uint32_t kth7823_diag_cr1 = 0;	// 失败帧的现场快照（[TEMP] 诊断用：确认是 SPE 未开、TXE 不置位还是 RXNE 不来）
 volatile uint32_t kth7823_diag_sr  = 0;
 
-// 滤波变量（慢路径 1kHz）
-static float filtered_cos = 1.0f;
+// 内部变量
+static float filtered_cos = 1.0f;	// 滤波变量（慢路径 1kHz）
 static float filtered_sin = 0.0f;
 static uint8_t filter_initialized = 0;
-
-// 解包裹状态（快路径 20kHz）
-static volatile uint16_t last_raw_angle = 0;   // 中断写、主循环读（16 位原子）
+static volatile uint16_t last_raw_angle = 0;   // 解包裹状态（快路径 20kHz）中断写、主循环读（16 位原子）
 static uint8_t  raw_initialized = 0;
 static float    angle_unwrapped = 0.0f;      // 连续单圈角度（解包裹后）
 static float    angle_prev_valid = 0.0f;     // 上一有效帧的多圈角（供一拍差分算 ω）
 static uint32_t last_valid_cyc = 0;          // 上一有效帧的 DWT 时间戳
-
-// 测速状态（慢路径 1kHz）
-static float    last_unwrapped_angle = 0.0f;
+static float    last_unwrapped_angle = 0.0f;	// 测速状态（慢路径 1kHz）
 static uint32_t last_speed_tick = 0;
-
-// 帧重入保护：SPI1 只允许一个调用者，异常重入直接丢弃（绝不并发拉 CS）
-static volatile uint8_t spi_in_frame = 0;
+static volatile uint8_t spi_in_frame = 0;	// 帧重入保护：SPI1 只允许一个调用者，异常重入直接丢弃（绝不并发拉 CS）
 
 // 角度弧度转换
 static float raw_to_rad(uint16_t raw)

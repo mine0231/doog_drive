@@ -19,20 +19,6 @@ static uint16_t DRV8353_BuildCmd(uint8_t reg, uint16_t data, uint8_t read)
     return (read << 15) | ((reg & 0x0F) << 11) | (data & 0x07FF);
 }
 
-// 向 DRV8353F 写入寄存器
-void DRV8353_WriteReg(uint8_t reg, uint16_t data)
-{
-    uint16_t cmd = DRV8353_BuildCmd(reg, data, 0);
-    uint16_t tx = cmd;   // 16 位单帧，HAL 16 位模式按 sizeof(uint16_t) 步进
-    uint16_t rx = 0;
-
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_RESET);
-		DWT_DelayUs(1);
-    HAL_SPI_TransmitReceive(&hspi2, (uint8_t *)&tx, (uint8_t *)&rx, 1, 100);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_SET);
-}
-
-
 // 读取 DRV8353F 寄存器
 uint16_t DRV8353_ReadReg(uint8_t reg)
 {
@@ -67,55 +53,17 @@ static void DRV8353_ConfigRegs(void)
 	DRV8353_WriteReg(DRV8353_REG_CSA_CTRL, DRV8353_CSA_DISABLE);
 }
 
-// DRV8353F 初始化
-void DRV8353_Init(void)
-{	
-    DRV8353_Enable();
-
-		// 等待芯片上电稳定
-		DWT_DelayMs(100);
-
-		DRV8353_ConfigRegs();
-
-		// 读取状态寄存器确认配置成功
-		status = DRV8353_ReadReg(DRV8353_REG_STATUS1);
-	
-    // 检查 FAULT 位 (STATUS1 bit10 = 0x0400)
-    if (status & 0x0400) {
-    // 清除故障（写 CLR_FLT 位）
-		DRV8353_ClearFault();
-    }
-}
-
-// 清除故障
-void DRV8353_ClearFault(void)
+// 向 DRV8353F 写入寄存器
+void DRV8353_WriteReg(uint8_t reg, uint16_t data)
 {
-    // 读取当前 DRIVER_CTRL 值，置位 CLR_FLT，再写回
-    uint16_t ctrl = DRV8353_ReadReg(DRV8353_REG_DRIVER_CTRL);
-    DRV8353_WriteReg(DRV8353_REG_DRIVER_CTRL, ctrl | DRV8353_CLR_FAULT);
-    // 等待清除完成
-	DWT_DelayMs(10);
-}
+    uint16_t cmd = DRV8353_BuildCmd(reg, data, 0);
+    uint16_t tx = cmd;   // 16 位单帧，HAL 16 位模式按 sizeof(uint16_t) 步进
+    uint16_t rx = 0;
 
-/**
-  * @brief  过流/故障后的驱动恢复动作（不含重试计数与锁定判断）
-  *         清故障锁存位 -> 恢复 PWM 控制脚 -> 使能驱动 -> 重启 TIM1 三路 PWM
-  * @note   调用前需确认故障源已排除；若需状态机/锁定逻辑，见 FOC.c 的 FOC_STATE_FAULT 状态机
-  */
-void DRV8353_Recover(void)
-{
-    DRV8353_Enable();                   // PA11 拉高，退出睡眠(EN=1)
-    DWT_DelayMs(2);                     // tREADY：EN 拉高到 SPI 就绪(数据手册典型 1ms)
-    DRV8353_ConfigRegs();               // 重新写入完整运行配置，覆盖睡眠清掉的默认值
-    DRV8353_ClearFault();               // 清 DRV8353 故障锁存位(需在 EN 有效时写)
-    DRV8353_PWM_ctrl_ON();              // PB12 拉高，恢复 PWM 控制脚
-    // 恢复前清零占空比，避免残留值导致恢复瞬间满电流冲击
-    TIM1->CCR1 = 0;
-    TIM1->CCR2 = 0;
-    TIM1->CCR3 = 0;
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_RESET);
+		DWT_DelayUs(1);
+    HAL_SPI_TransmitReceive(&hspi2, (uint8_t *)&tx, (uint8_t *)&rx, 1, 100);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_SET);
 }
 
 // 最近一次自检读回快照
@@ -166,3 +114,57 @@ uint16_t DRV8353_SelfCheck(void)
     drv8353_selfcheck.result = result;
     return result;
 }
+
+// DRV8353F 初始化
+void DRV8353_Init(void)
+{	
+    DRV8353_Enable();
+
+		// 等待芯片上电稳定
+		DWT_DelayMs(100);
+
+		DRV8353_ConfigRegs();
+
+		// 读取状态寄存器确认配置成功
+		status = DRV8353_ReadReg(DRV8353_REG_STATUS1);
+	
+    // 检查 FAULT 位 (STATUS1 bit10 = 0x0400)
+    if (status & 0x0400) {
+    // 清除故障（写 CLR_FLT 位）
+		DRV8353_ClearFault();
+    }
+}
+
+// 清除故障
+void DRV8353_ClearFault(void)
+{
+    // 读取当前 DRIVER_CTRL 值，置位 CLR_FLT，再写回
+    uint16_t ctrl = DRV8353_ReadReg(DRV8353_REG_DRIVER_CTRL);
+    DRV8353_WriteReg(DRV8353_REG_DRIVER_CTRL, ctrl | DRV8353_CLR_FAULT);
+    // 等待清除完成
+	DWT_DelayMs(10);
+}
+
+/**
+  * @brief  过流/故障后的驱动恢复动作（不含重试计数与锁定判断）
+  *         清故障锁存位 -> 恢复 PWM 控制脚 -> 使能驱动 -> 重启 TIM1 三路 PWM
+  * @note   调用前需确认故障源已排除；若需状态机/锁定逻辑，见 FOC.c 的 FOC_STATE_FAULT 状态机
+  */
+void DRV8353_Recover(void)
+{
+    DRV8353_Enable();                   // PA11 拉高，退出睡眠(EN=1)
+    DWT_DelayMs(2);                     // tREADY：EN 拉高到 SPI 就绪(数据手册典型 1ms)
+    DRV8353_ConfigRegs();               // 重新写入完整运行配置，覆盖睡眠清掉的默认值
+    DRV8353_ClearFault();               // 清 DRV8353 故障锁存位(需在 EN 有效时写)
+    DRV8353_PWM_ctrl_ON();              // PB12 拉高，恢复 PWM 控制脚
+    // 恢复前清零占空比，避免残留值导致恢复瞬间满电流冲击
+    TIM1->CCR1 = 0;
+    TIM1->CCR2 = 0;
+    TIM1->CCR3 = 0;
+		TIM_CCxChannelCmd(TIM1, TIM_CHANNEL_1, TIM_CCx_ENABLE);
+		TIM_CCxChannelCmd(TIM1, TIM_CHANNEL_2, TIM_CCx_ENABLE);
+		TIM_CCxChannelCmd(TIM1, TIM_CHANNEL_3, TIM_CCx_ENABLE);
+		__HAL_TIM_MOE_ENABLE(&htim1); 
+}
+
+

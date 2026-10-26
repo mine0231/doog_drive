@@ -18,6 +18,16 @@ extern "C" {
 extern volatile uint32_t control_tick;  // 控制节拍计数
 extern float control_dt;                // 控制周期 (秒)
 extern uint32_t s_tick; 								// 本控制拍的时间戳(ms)，每拍由 TIM1 回调刷新一次
+extern float manual_voltage;						// 开环电压
+extern float manual_speed;							// 开环速度
+extern float control_dt;								// 控制周期
+
+
+// 控制命令门控：1=放行 0=拒绝（硬件错误锁死后拒绝控制命令，诊断命令不调用本函数）
+uint8_t MotorControl_CommandGate(void);
+
+// 上电自检是否失败（1=硬件错误、控制命令已锁死）：供 FOC.C 的 LED 状态机读取
+uint8_t MotorControl_BootIsHwError(void);
 
 // 初始化与节拍
 void MotorControl_Init(void);
@@ -28,11 +38,6 @@ void MotorControl_BootSequence(void);
 // UIF直连函数
 void FOC_TIM1_UpdateIRQHandler(void);
 
-// 控制命令门控：1=放行 0=拒绝（硬件错误锁死后拒绝控制命令，诊断命令不调用本函数）
-uint8_t MotorControl_CommandGate(void);
-
-// 上电自检是否失败（1=硬件错误、控制命令已锁死）：供 FOC.C 的 LED 状态机读取
-uint8_t MotorControl_BootIsHwError(void);
 
 #ifdef __cplusplus
 }

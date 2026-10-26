@@ -3,7 +3,7 @@
 #include "kth7823.h"
 #include "sense.h"
 #include "foc.h"
-#include "Protect.h"     // Protect_StopPWM（零偏标定失败时统一停三路输出）
+#include "protect.h"     // Protect_StopPWM（零偏标定失败时统一停三路输出）
 #include "tim.h"
 #include "adc.h"
 #include "stm32g4xx_hal_rcc.h"
@@ -18,14 +18,67 @@
 #define BOOT_SC_ATTEMPT_MAX    3      // 参数自检总尝试次数（计入第一次，共 3 次）
 #define BOOT_SC_RETRY_DELAY_MS 20     // 自检重试之间的短延时(ms)，让驱动/SPI 稳定
 
-
+// 全局变量
 uint32_t s_tick = 0; // 同一拍内时间戳一致
 float manual_voltage = 0.0f;	// 手动给定电压 (V)，默认 0，上电不转
 float manual_speed = 0.0f;	  // 手动给定速度 (rad/s)，默认 0
 float control_dt = 0.01f;  // 控制周期 (秒)
 volatile uint32_t control_tick = 0;	// 控制节拍计数（中断）
 volatile uint8_t motor_ready = 0;   // 电流偏移校准完成前为 0，禁止中断里跑 FOC/保护
+
+// 内部变量
 static uint8_t boot_hw_error = 0;   // 1 = 上电自检三次仍不通过，硬件错误（锁死控制命令，需检修）
+
+// 上电自动执行启动序列
+// 重新参数设置 + 驱动自检：使能 + 重写全部配置 + 清故障 + 重启 PWM，再读回比对
+static uint16_t Boot_ParamSetAndSelfCheck(void)
+{
+    DRV8353_Recover();            // 重新设置参数
+    return DRV8353_SelfCheck();   // 自检（读回比对 + STATUS 检查）
+}
+
+// 打印自检读回明细（与期望设置值对照）
+static void Boot_PrintSelfCheck(uint16_t sc)
+{
+    static char line[256];   // 静态区：主栈仅 1KB，避免占用（仅启动序列调用，不可重入）
+    sprintf(line,
+            "[BOOT] DRV8353 self-check: %s\r\n"
+            "       readback CTRL=0x%03X(exp 0x%03X) HS=0x%03X(exp 0x%03X) LS=0x%03X(exp 0x%03X)\r\n"
+            "                OCP=0x%03X(exp 0x%03X) CSA=0x%03X(exp 0x%03X)\r\n"
+            "                STATUS1=0x%03X STATUS2=0x%03X\r\n",
+            (sc == DRV8353_SC_OK) ? "PASS" : "FAIL",
+            drv8353_selfcheck.driver_ctrl, (DRV8353_PWM_MODE_3X | DRV8353_OCP_ACT_ALL),
+            drv8353_selfcheck.gate_hs,     DRV8353_DRIVE_STRENGTH_HS,
+            drv8353_selfcheck.gate_ls,     DRV8353_DRIVE_STRENGTH_LS,
+            drv8353_selfcheck.ocp_ctrl,    DRV8353_OCP_CONFIG,
+            drv8353_selfcheck.csa_ctrl,    DRV8353_CSA_DISABLE,
+            drv8353_selfcheck.status1,     drv8353_selfcheck.status2);
+    UART_SendString(line);
+
+    if (sc & 0x001F)                    UART_SendString("[BOOT]   config readback mismatch\r\n");
+    if (sc & DRV8353_SC_STATUS1_FAULT)  UART_SendString("[BOOT]   STATUS1 reports fault bits\r\n");
+    if (sc & DRV8353_SC_STATUS2_FAULT)  UART_SendString("[BOOT]   STATUS2 reports fault bits\r\n");
+}
+
+// 控制命令门控：1=放行 0=拒绝
+uint8_t MotorControl_CommandGate(void)
+{
+    if (boot_hw_error || sense_hw_error) {
+        UART_SendString("[DEVICE] ERROR: HARDWARE ERROR - control disabled. Maintenance required.\r\n");
+        return 0;
+    }
+    return 1;
+}
+
+/* 上电自检是否失败（硬件错误、控制命令被锁死）
+ * 供 FOC.C 的 LED 状态机（20kHz 中断内）读取，避免跨文件访问 static 变量 */
+uint8_t MotorControl_BootIsHwError(void)
+{
+    if (boot_hw_error || sense_hw_error) {
+        return 1;
+    }
+    return 0;
+}
 
 // 电机控制初始化
 void MotorControl_Init(void)
@@ -110,58 +163,6 @@ void FOC_TIM1_UpdateIRQHandler(void)
 
     control_tick++;
 }	
-
-
-// 上电自动执行启动序列
-// 重新参数设置 + 驱动自检：使能 + 重写全部配置 + 清故障 + 重启 PWM，再读回比对
-static uint16_t Boot_ParamSetAndSelfCheck(void)
-{
-    DRV8353_Recover();            // 重新设置参数
-    return DRV8353_SelfCheck();   // 自检（读回比对 + STATUS 检查）
-}
-
-// 打印自检读回明细（与期望设置值对照）
-static void Boot_PrintSelfCheck(uint16_t sc)
-{
-    static char line[256];   // 静态区：主栈仅 1KB，避免占用（仅启动序列调用，不可重入）
-    sprintf(line,
-            "[BOOT] DRV8353 self-check: %s\r\n"
-            "       readback CTRL=0x%03X(exp 0x%03X) HS=0x%03X(exp 0x%03X) LS=0x%03X(exp 0x%03X)\r\n"
-            "                OCP=0x%03X(exp 0x%03X) CSA=0x%03X(exp 0x%03X)\r\n"
-            "                STATUS1=0x%03X STATUS2=0x%03X\r\n",
-            (sc == DRV8353_SC_OK) ? "PASS" : "FAIL",
-            drv8353_selfcheck.driver_ctrl, (DRV8353_PWM_MODE_3X | DRV8353_OCP_ACT_ALL),
-            drv8353_selfcheck.gate_hs,     DRV8353_DRIVE_STRENGTH_HS,
-            drv8353_selfcheck.gate_ls,     DRV8353_DRIVE_STRENGTH_LS,
-            drv8353_selfcheck.ocp_ctrl,    DRV8353_OCP_CONFIG,
-            drv8353_selfcheck.csa_ctrl,    DRV8353_CSA_DISABLE,
-            drv8353_selfcheck.status1,     drv8353_selfcheck.status2);
-    UART_SendString(line);
-
-    if (sc & 0x001F)                    UART_SendString("[BOOT]   config readback mismatch\r\n");
-    if (sc & DRV8353_SC_STATUS1_FAULT)  UART_SendString("[BOOT]   STATUS1 reports fault bits\r\n");
-    if (sc & DRV8353_SC_STATUS2_FAULT)  UART_SendString("[BOOT]   STATUS2 reports fault bits\r\n");
-}
-
-// 控制命令门控：1=放行 0=拒绝
-uint8_t MotorControl_CommandGate(void)
-{
-    if (boot_hw_error || sense_hw_error) {
-        UART_SendString("[DEVICE] ERROR: HARDWARE ERROR - control disabled. Maintenance required.\r\n");
-        return 0;
-    }
-    return 1;
-}
-
-/* 上电自检是否失败（硬件错误、控制命令被锁死）
- * 供 FOC.C 的 LED 状态机（20kHz 中断内）读取，避免跨文件访问 static 变量 */
-uint8_t MotorControl_BootIsHwError(void)
-{
-    if (boot_hw_error || sense_hw_error) {
-        return 1;
-    }
-    return 0;
-}
 
 // 上电自动执行启动序列
 void MotorControl_BootSequence(void)

@@ -1,18 +1,32 @@
 #include "fdcan_app.h"
 #include "fdcan.h"
-#include "DRV8353.h"
+#include "drv8353.h"
 #include "sense.h"
 #include "foc.h"
 #include "kth7823.h"
-#include "Protect.h"
+#include "protect.h"
 #include "motor_control.h"   // MotorControl_CommandGate（硬件错误锁死门控）
 #include "math.h"
 
-extern volatile float bus_voltage;  
 
 // 接收队列（中断生产 / 主循环消费，单生产者单消费者无锁环形缓冲）
 #define FDCAN_RX_QUEUE_SIZE   16                          // 队列深度，必须是 2 的幂
 #define FDCAN_RX_QUEUE_MASK   (FDCAN_RX_QUEUE_SIZE - 1)
+
+// 角度换算常量（不依赖 PI 宏，避免头文件依赖差异）
+#define FD_DEG2RAD   0.01745329252f   // 度 -> rad
+#define FD_RAD2DEG   57.29577951308f  // rad -> 度
+
+// 应用层需要使能的 FDCAN 中断集合（初始化与 BusOff 恢复共用一份，避免两处取值漂移）
+//   RX FIFO0 新帧 + 错误状态(EW/EP/BO) + 协议错误(仲裁段/数据段，仅做诊断计数)
+#define FDCAN_APP_IT_LIST   (FDCAN_IT_RX_FIFO0_NEW_MESSAGE | \
+                             FDCAN_IT_ERROR_WARNING        | \
+                             FDCAN_IT_ERROR_PASSIVE        | \
+                             FDCAN_IT_BUS_OFF              | \
+                             FDCAN_IT_ARB_PROTOCOL_ERROR   | \
+                             FDCAN_IT_DATA_PROTOCOL_ERROR)
+
+
 
 typedef struct {
     uint32_t id;         // 帧 ID（标准帧 11 位）
@@ -27,15 +41,11 @@ static volatile uint16_t rx_tail = 0;   // 读取索引：只在主循环里推�
 // 队列满而丢弃的帧数（诊断用：持续增长说明主循环处理速度跟不上上位机发帧速率）
 volatile uint32_t fdcan_rx_drop_count = 0;
 
-extern float manual_speed;
-extern float manual_voltage;
-
-// 角度换算常量（不依赖 PI 宏，避免头文件依赖差异）
-#define FD_DEG2RAD   0.01745329252f   // 度 -> rad
-#define FD_RAD2DEG   57.29577951308f  // rad -> 度
-
 static FDCAN_TxHeaderTypeDef tx_header;
 static uint8_t tx_data[8];
+
+// 故障事件主动推送标志：1 = 本次故障事件已主动发过一帧 0x400（离开故障态时复位）
+static uint8_t fdcan_fault_push_done = 0;
 
 // CAN 错误 / 总线关闭监测变量（回调中更新，主循环查询）
 volatile uint32_t fdcan_error_flags  = 0;
@@ -57,14 +67,6 @@ volatile uint8_t  fdcan_last_rx_dlc      = 0;
 volatile uint8_t  fdcan_last_rx_data[8]  = {0};
 volatile uint32_t fdcan_last_rx_ms       = 0;
 
-// 应用层需要使能的 FDCAN 中断集合（初始化与 BusOff 恢复共用一份，避免两处取值漂移）
-//   RX FIFO0 新帧 + 错误状态(EW/EP/BO) + 协议错误(仲裁段/数据段，仅做诊断计数)
-#define FDCAN_APP_IT_LIST   (FDCAN_IT_RX_FIFO0_NEW_MESSAGE | \
-                             FDCAN_IT_ERROR_WARNING        | \
-                             FDCAN_IT_ERROR_PASSIVE        | \
-                             FDCAN_IT_BUS_OFF              | \
-                             FDCAN_IT_ARB_PROTOCOL_ERROR   | \
-                             FDCAN_IT_DATA_PROTOCOL_ERROR)
 
 /**
  * @brief FDCAN 应用层初始化
@@ -291,6 +293,7 @@ static void FDCAN_HandleCommand(const FDCAN_RxFrame_t *msg)
     // （心跳/查询 0x08/0x09/0x10 不受影响，锁死后仍可诊断）
     if (cmd >= CMD_SET_SPEED && cmd <= CMD_SET_OPENLOOP_ANGLE_HOLD) {
         if (!MotorControl_CommandGate()) return;
+				if (foc.mode == FOC_STATE_FAULT)  return;  // 故障退避中：等恢复后再接受控制
     }
 
     switch (cmd) {
@@ -397,8 +400,13 @@ static void FDCAN_HandleCommand(const FDCAN_RxFrame_t *msg)
             break;
 
         case CMD_GET_STATUS:
-            // 上位机请求状态，立即打包发送反馈
+            // 上位机请求状态，立即打包发送反馈（0x200：byte0=0/1/2 状态，byte5=模式）
             FDCAN_SendStatus();
+            // 处于故障态：紧跟一帧故障详情（0x400），把故障代码/掩码/STATUS1/2 一并上报。
+            // 无故障时不发，总线负载与旧协议完全一致。
+            if (foc.mode == FOC_STATE_FAULT) {
+                FDCAN_SendFault();
+            }
             break;
             
         default:
@@ -428,6 +436,16 @@ void FDCAN_App_Process(void)
     if (arrive_report_pending) {
         arrive_report_pending = 0;
         FDCAN_SendOLStatus(1);
+    }
+
+    // 故障事件主动上报：进入故障态后立即推一帧 0x400（同一次事件只推一次，不依赖上位机轮询）。
+    // 仅在已联机时推送，避免本地调试（无上位机）时把帧打到没人接收的总线上。
+    if (foc.mode == FOC_STATE_FAULT) {
+        if (!fdcan_fault_push_done && Protect_CommIsArmed()) {
+            FDCAN_SendFault();
+        }
+    } else {
+        fdcan_fault_push_done = 0;   // 故障解除：复位标志，下一次故障事件可再主动推送
     }
 }
 
@@ -475,6 +493,50 @@ void FDCAN_SendStatus(void)
         fdcan_tx_count++;
     } else {
         fdcan_tx_fail_count++;
+    }
+}
+
+/**
+ * @brief 发送故障详情帧（0x10 查询的附加响应，帧 ID = FBK_FAULT_FRAME_ID = 0x400 + NODE_ID）
+ *        Byte0   : 故障码 FAULT_CODE_*（1=HARDWARE 2=STALL 3=ENCODER_STALL 4=OVERTEMP 5=OVERVOLT
+ *                  6=UNDERVOLT 7=OVERSPEED 8=PHASE_OC 9=I2T 10=POS_ERROR 11=SOFT_LIMIT 12=COMM_TIMEOUT）
+ *        Byte1   : 状态位 bit0=当前仍在故障态，bit1=STATUS1/2 有效（fault_status_valid），bit2~7 保留 0
+ *        Byte2-3 : 故障掩码 uint16（bit n = FAULT_CODE_n，本次故障事件内触发过的所有保护）
+ *        Byte4-5 : DRV8353 STATUS1 uint16（仅 Byte0=1 且 bit1=1 时有效）
+ *        Byte6-7 : DRV8353 STATUS2 uint16（同上）
+ * @note  故障码/掩码在故障持续期间由 FOC 保持有效（不在串口上报里清零），
+ *        故障恢复（FOC_SetMode 离开 FAULT 态切回 IDLE）时统一清零，故本帧只在故障态下发送。
+ *        多字节字段均为小端。
+ */
+void FDCAN_SendFault(void)
+{
+    tx_header.Identifier = FBK_FAULT_FRAME_ID;
+
+    // 故障锁存快照（fault_code/fault_mask 只在离开 FAULT 态时才被清除，故障期间稳定有效）
+    uint8_t  code = fault_code;
+    uint16_t mask = fault_mask;
+    uint16_t s1   = fault_status1;
+    uint16_t s2   = fault_status2;
+
+    tx_data[0] = code;
+
+    tx_data[1] = 0;
+    if (foc.mode == FOC_STATE_FAULT) tx_data[1] |= 0x01u;   // 当前仍在故障退避中
+    if (fault_status_valid)          tx_data[1] |= 0x02u;   // STATUS1/2 是本次 nFAULT 读到的
+
+    tx_data[2] = (uint8_t)(mask & 0xFF);
+    tx_data[3] = (uint8_t)((mask >> 8) & 0xFF);
+    tx_data[4] = (uint8_t)(s1 & 0xFF);
+    tx_data[5] = (uint8_t)((s1 >> 8) & 0xFF);
+    tx_data[6] = (uint8_t)(s2 & 0xFF);
+    tx_data[7] = (uint8_t)((s2 >> 8) & 0xFF);
+
+    // 发送：TX FIFO 满或总线异常时直接丢弃本帧，绝不阻塞主循环
+    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &tx_header, tx_data) == HAL_OK) {
+        fdcan_tx_count++;
+        fdcan_fault_push_done = 1;   // 已送达：本事件不再主动推送（查询响应仍会随 0x10 重发）
+    } else {
+        fdcan_tx_fail_count++;       // 失败不置标志，主循环下一轮会重试主动推送
     }
 }
 

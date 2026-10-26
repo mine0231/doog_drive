@@ -9,20 +9,16 @@
 #include "motor_control.h"
 
 
-// 过流保护
-extern volatile uint8_t fault_triggered;
-extern volatile uint8_t fault_code;   // 故障诊断码锁存
-extern float control_dt;   // 控制周期 (s)，I²t 累积用
-
 //编码器读数有效性（断线/无磁）监测
 volatile uint16_t encoder_stall_max = 0; // 记录观察到的最大连续异常读数次数（诊断用）
 static uint8_t encoder_fault_latched = 0;
+static volatile uint8_t comm_frame = 0;	// 通讯故障恢复凭据：故障触发后收到过新帧才允许恢复
 
 // 上位机通讯心跳（CAN）：每收到一帧 Protect_CommFeed 递增一次
 volatile uint32_t comm_rx_count = 0;    // 通讯心跳计数
 static uint32_t comm_last_count = 0;    // 上次检测时的心跳基准
 volatile uint32_t comm_silent_ticks = 0;// 通讯静默节拍（连续未收到数据的周期数，供串口观察）
-static uint8_t  comm_armed = 0;         // 收到首帧后置 1，失联保护才生效（未接上位机时不误触发）
+volatile uint8_t  comm_armed = 0;         // 收到首帧后置 1，失联保护才生效（未接上位机时不误触发）
 
 // I²t 热积累量（全局，供 FOC.c 恢复分支判断是否仍过热）
 volatile float i2t_accum = 0.0f;
@@ -94,7 +90,14 @@ void Protect_EncoderStallCheck(void)
 void Protect_CommFeed(void)
 {
     comm_rx_count++;
+	  comm_frame = 1;   // 收到帧：既有心跳，也是"通讯已恢复"的凭据
     comm_armed = 1;   // 收到首帧后使能失联保护
+}
+
+// "通讯已恢复"的凭据
+uint8_t Protect_CommFrameSeen(void) 
+{ 
+		return comm_frame; 
 }
 
 // 上位机通讯失联保护：连续 COMM_TIMEOUT_TICKS 个控制周期无新帧则停机
@@ -112,6 +115,7 @@ void Protect_CommTimeoutCheck(void)
         if (comm_silent_ticks < COMM_TIMEOUT_TICKS) comm_silent_ticks++;
         if (comm_silent_ticks >= COMM_TIMEOUT_TICKS) {
             fault_code = FAULT_CODE_COMM_TIMEOUT;   // 锁存通讯失联故障码
+						comm_frame = 0;
             DRV8353_Disable();
             Protect_StopPWM();
             fault_triggered = 1;   // 交由 FOC_STATE_FAULT 状态机退避恢复；重新收到帧后自动解除

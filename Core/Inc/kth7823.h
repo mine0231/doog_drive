@@ -55,9 +55,6 @@
  * 单帧流水线固有滞后正好 1 个控制周期；台架可微调 0.5~1.5 拍。 */
 #define KTH7823_ANGLE_DELAY_PERIODS  1.0f
 
-void KTH7823_Init(void);
-void KTH7823_Tick(uint32_t tick);   /* 仅由 TIM1 20kHz 中断调用（SPI1 唯一所有者） */
-void KTH7823_SlowUpdate(void);      /* 主循环 ≈1kHz：滤波角度（不碰 SPI） */
 
 // 编码器输出：volatile 标记跨中断上下文共享的实时值，不保证多字段快照一致性
 extern volatile float KTH7823_Angle_Rad;
@@ -81,5 +78,10 @@ extern volatile uint16_t kth7823_unwrap_glitch_cnt;
 
 // SPI 帧失败次数（HAL 返回非 OK / 重入被拒），诊断用，只增不清零
 extern volatile uint16_t kth7823_spi_err_cnt;
+
+// 函数声明
+void KTH7823_Init(void);
+void KTH7823_Tick(uint32_t tick);   /* 仅由 TIM1 20kHz 中断调用（SPI1 唯一所有者） */
+void KTH7823_SlowUpdate(void);      /* 主循环 ≈1kHz：滤波角度（不碰 SPI） */
 
 #endif

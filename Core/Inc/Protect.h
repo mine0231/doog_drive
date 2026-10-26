@@ -64,6 +64,24 @@
 // 超速"连续 N 拍确认"：抑制编码器解包裹跳变导致的单拍速度尖峰误触发
 #define OVERSPEED_CONFIRM_TICKS  5u   // 连续超阈拍数（2kHz 下 ≈2.5ms）
 
+
+// I²t 热积累量（FOC.c 恢复分支据此判断是否仍过热）
+extern volatile float i2t_accum;
+
+// 软限位阈值（减速器输出端位置，rad，默认 ±π = ±180° 输出端）
+extern float soft_limit_min;
+extern float soft_limit_max;
+
+// 通讯心跳计数：每收到一帧本节点 CAN 命令帧 +1（接收中断内自增），串口 can 诊断命令读取
+extern volatile uint32_t comm_rx_count;
+
+// 通讯静默节拍：连续多少控制周期（20kHz）未收到新帧，触发阈值 COMM_TIMEOUT_TICKS；
+// 收到新帧即清零，用于串口观察失联保护计时（需 Protect_CommTimeoutCheck 已启用才有意义）
+extern volatile uint32_t comm_silent_ticks;
+
+// 收到首帧后置 1，失联保护才生效（未接上位机时不误触发）
+extern volatile uint8_t  comm_armed;         
+
 // 关闭三路 PWM 输出但保持 TIM1 计数（供所有保护分支/故障回调统一调用）
 void Protect_StopPWM(void);
 
@@ -79,15 +97,11 @@ void Protect_CommFeed(void);
 // 关闭失联保护（进入本地调试态），串口 enable 命令调用；CAN 再次发帧后自动恢复
 void Protect_CommDisarm(void);
 
-// 通讯心跳计数：每收到一帧本节点 CAN 命令帧 +1（接收中断内自增），串口 can 诊断命令读取
-extern volatile uint32_t comm_rx_count;
-
-// 通讯静默节拍：连续多少控制周期（20kHz）未收到新帧，触发阈值 COMM_TIMEOUT_TICKS；
-// 收到新帧即清零，用于串口观察失联保护计时（需 Protect_CommTimeoutCheck 已启用才有意义）
-extern volatile uint32_t comm_silent_ticks;
-
 // 当前失联保护是否已武装（1 = 收到过 CAN 帧、失联检测已生效），串口 can 诊断命令显示
 uint8_t Protect_CommIsArmed(void);
+
+// "通讯已恢复"的凭据 
+uint8_t Protect_CommFrameSeen(void);
 
 // 上位机通讯连续中断超时
 void Protect_CommTimeoutCheck(void);
@@ -107,12 +121,6 @@ void Protect_PhasePeakCheck(void);
 // 累计 I²t 热积累并检测持续过流
 void Protect_I2tCheck(void);
 
-// I²t 热积累量（FOC.c 恢复分支据此判断是否仍过热）
-extern volatile float i2t_accum;
-
-// 软限位阈值（减速器输出端位置，rad，默认 ±π = ±180° 输出端）
-extern float soft_limit_min;
-extern float soft_limit_max;
 // 位置跟随误差阈值（rad）
 extern float pos_error_limit;
 

@@ -79,6 +79,8 @@ extern volatile float mos_temperature;  // MOS温度 (℃)
 extern volatile float ntc_temperature;  // 线圈温度 (℃)
 extern volatile uint8_t sense_hw_error;		// 电流零偏错误标志位
 
+extern volatile float bus_voltage;		// 母线电压结果
+
 void CurrentSense_Init(void);
 void CurrentSense_Update(void);
 void TempSense_Update(void);

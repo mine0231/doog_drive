@@ -33,5 +33,5 @@ drive/fdcan_app.o: ..\Core\Src\fdcan_app.c ..\Core\Inc\fdcan_app.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_uart_ex.h \
   ..\Core\Inc\foc.h ..\Core\Inc\pid.h ..\Core\Inc\drv8353.h \
   ..\Core\Inc\fdcan.h ..\Core\Inc\sense.h ..\Core\Inc\kth7823.h \
-  ..\Core\Inc\Protect.h ..\Core\Inc\motor_control.h ..\Core\Inc\spi.h \
+  ..\Core\Inc\protect.h ..\Core\Inc\motor_control.h ..\Core\Inc\spi.h \
   ..\Core\Inc\kth7823_2.h

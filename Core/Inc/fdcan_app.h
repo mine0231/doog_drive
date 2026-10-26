@@ -20,6 +20,10 @@
 #define FBK_FRAME_ID        (0x200 + NODE_ID)   // 本板反馈帧 ID（0x201 ~ 0x20C）
 #define FBK_OL_FRAME_ID     (0x300 + NODE_ID)   // 开环动作状态帧 ID（0x301 ~ 0x30C），与 0x200 反馈帧完全隔离
                                                 //   仅 0x09 查询时回一帧，不增加总线负载
+#define FBK_FAULT_FRAME_ID  (0x400 + NODE_ID)   // 故障详情帧 ID（0x401 ~ 0x40C），与 0x200/0x300 完全隔离
+                                                //   仅在 foc.mode == FOC_STATE_FAULT 期间发送：
+                                                //     ① 0x10 查询时紧跟状态帧补发一帧（带故障码）；
+                                                //     ② 进入故障态时主动推一帧，不必等轮询
 
 // ---------- 上位机命令 ID (命令帧数据区 byte0，上位机发送 -> 下位机接收) ----------
 #define CMD_SET_SPEED      0x01   // 设置目标速度 (int16, 单位 rad/s * 10)
@@ -76,5 +80,6 @@ void FDCAN_App_Init(void);
 void FDCAN_App_Process(void);    // 主循环中调用，处理接收到的指令 + 总线关闭自动恢复
 void FDCAN_SendStatus(void);     // 发送状态反馈
 void FDCAN_SendOLStatus(uint8_t evt);   // 发送开环动作状态反馈（命令 0x09 的响应帧，ID=FBK_OL_FRAME_ID）
+void FDCAN_SendFault(void);      // 发送故障详情（故障态下 0x10 查询的附加响应帧，ID=FBK_FAULT_FRAME_ID）
 
 #endif

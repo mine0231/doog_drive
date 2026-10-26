@@ -44,4 +44,10 @@ void UART_PrintSystemReport(void);
 // 上报一次故障事件触发过的全部保护掩码（主循环调用，与按 fault_code 打印的 "FAULT: XXX" 互补）
 void UART_PrintFaultMask(uint16_t mask, uint8_t code);
 
+// 故障串口上报
+void UART_FaultReport(void);
+
+// 丢弃can期间收到的串口数据
+void UART_Cmd_Discard(void);
+
 #endif
