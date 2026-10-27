@@ -10,7 +10,7 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 #include <math.h>
-#include <KTH7823.h>
+#include <kth7823.h>
 #include <kth7823_2.h>
 #include <foc.h>
 #include <sense.h>

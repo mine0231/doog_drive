@@ -32,6 +32,6 @@ drive/stm32g4xx_it.o: ..\Core\Src\stm32g4xx_it.c ..\Core\Inc\main.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_uart.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_uart_ex.h \
   ..\Core\Inc\stm32g4xx_it.h ..\Core\Inc\motor_control.h \
-  ..\Core\Inc\spi.h ..\Core\Inc\KTH7823.h ..\Core\Inc\kth7823_2.h \
+  ..\Core\Inc\spi.h ..\Core\Inc\kth7823.h ..\Core\Inc\kth7823_2.h \
   ..\Core\Inc\foc.h ..\Core\Inc\pid.h ..\Core\Inc\drv8353.h \
   ..\Core\Inc\sense.h

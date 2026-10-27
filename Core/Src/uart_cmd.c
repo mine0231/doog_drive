@@ -4,6 +4,7 @@
 #include "foc.h"
 #include "sense.h"
 #include "kth7823.h"
+#include "kth7823_2.h"
 #include "protect.h"
 #include "fdcan_app.h"  
 #include "fdcan.h"       // hfdcan2（串口 can 诊断命令读外设状态/错误计数）
@@ -149,7 +150,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
  *   - 保持：到位后冻结电角度（foc.openloop_hold=1），改用 d 轴持续通电（与 ALIGN 磁力定位
  *           同形态），转子被磁力钳在到位点附近，偏离即自动产生回复力矩；不必依赖精确角度。
  *           稳定吸引域约 ±180 电角度 ≈ ±8.6° 电机轴机械角（极对数 21 → 电周期 17.14°）。
- *   - 回拉：以电机轴编码器(KTH7823_Angle_Multiturn，未滤波)为反馈，偏差超出
+ *   - 回拉：以电机轴编码器(kth7823_Angle_Multiturn，未滤波)为反馈，偏差超出
  *           TEST_OL_HOLD_BAND_DEG 时解除冻结、按低速开环回拉，回到滞环内重新冻结保持。
  * 说明：
  *   - 角度为“相对当前点”的相对量，非绝对零点；打滑/负载会导致偏差（故不要求精度）。
@@ -190,7 +191,7 @@ static float UART_OL_NormElecAngle(float a)
 // 当前转子电角度（与 FOC_SetMode 进入开环时的表达式/角度源完全一致）
 static float UART_OL_RotorElecAngle(void)
 {
-    return UART_OL_NormElecAngle((KTH7823_Angle_Multiturn - encoder_offset) *
+    return UART_OL_NormElecAngle((kth7823_Angle_Multiturn - encoder_offset) *
                                  (float)encoder_direction * (float)MOTOR_POLE_PAIRS);
 }
 
@@ -203,7 +204,7 @@ static void UART_Test_OpenLoopHold(float hold_vol)
     const float hyst = TEST_OL_HOLD_HYST_DEG * TEST_OL_DEG2RAD;   // 回拉滞环 (±rad，电机轴)
 
     // 到位点（电机轴多圈机械角）；同时清零速度给定，避免解除冻结瞬间角度继续积分
-    float hold_mech = KTH7823_Angle_Multiturn;
+    float hold_mech = kth7823_Angle_Multiturn;
     manual_speed          = 0.0f;
     foc.target_speed      = 0.0f;
     foc.target_speed_ramp = 0.0f;
@@ -224,7 +225,7 @@ static void UART_Test_OpenLoopHold(float hold_vol)
         HAL_IWDG_Refresh(&hiwdg);
 
         // 偏差：正 = 转子朝“正转（+开环方向）”偏出到位点
-        float dev = (KTH7823_Angle_Multiturn - hold_mech) * (float)encoder_direction;
+        float dev = (kth7823_Angle_Multiturn - hold_mech) * (float)encoder_direction;
 
         if (fabsf(dev) > band) {
             // ---- 逃出死区：解除冻结，按低速开环回拉 ----
@@ -240,7 +241,7 @@ static void UART_Test_OpenLoopHold(float hold_vol)
                 UART_Tx_Poll();
                 HAL_IWDG_Refresh(&hiwdg);
 
-                dev = (KTH7823_Angle_Multiturn - hold_mech) * (float)encoder_direction;
+                dev = (kth7823_Angle_Multiturn - hold_mech) * (float)encoder_direction;
                 if (fabsf(dev) <= hyst) break;                            // 回到滞环内
                 if ((dev > 0.0f) != (manual_speed < 0.0f)) break;         // 已越过到位点（偏差变号）
                 if ((HAL_GetTick() - t_hold) >= TEST_OL_HOLD_MS) break;   // 保持总时长到点，不再回拉
@@ -502,8 +503,8 @@ void UART_Cmd_Process(void)
                 "TargetSpeed=%.2f rad/s | Voltage=%.2f V | V_Bus=%.2f V\r\n | NTC_Temp=%.2f ℃\r\n "
                 "Align: offset=%.4f rad (%.2f deg) | dir=%+d\r\n"
                 "ADC_A=%u(%.3fV) ADC_B=%u(%.3fV) | InjMiss=%lu | TXdrop=%lu\r\n",
-                KTH7823_Speed_Rads, KTH7823_Speed_RPM,
-                KTH7823_Angle_Deg,
+                kth7823_Speed_Rads, kth7823_Speed_RPM,
+                kth7823_Angle_Deg,
                 current_A, current_B, current_C,
                 foc.Id, foc.Iq, (int)foc.mode,
                 foc.target_speed, manual_voltage, bus_voltage,ntc_temperature,	
@@ -679,6 +680,22 @@ void UART_Cmd_Process(void)
     if (strcmp(cmd_buf, "disable") == 0) {
         DRV8353_Disable();
         UART_SendString("DRV8353 output disabled\r\n");
+        return;
+    }
+
+    // zero - 把当前输出角标定为机械零点并写入 Flash（先停驱动，避免擦除期 PWM 冻结）
+    if (strcmp(cmd_buf, "zero") == 0) {
+        DRV8353_Disable();
+        FOC_SetMode(FOC_STATE_IDLE);
+        kth7823_2_SetZero();
+        UART_SendString("Zero calibrated & saved\r\n");
+        return;
+    }
+    // zero? - 查询当前机械零点偏置
+    if (strcmp(cmd_buf, "zero?") == 0) {
+        sprintf(response, "zero_offset=%.4f rad (%.2f deg)\r\n",
+                kth7823_2_zero_offset, kth7823_2_zero_offset * 57.2957795f);
+        UART_SendString(response);
         return;
     }
 
@@ -868,7 +885,7 @@ void UART_SendStatus(void)
             current_A, current_B, current_C,
             bus_voltage,
             ntc_temperature,
-            KTH7823_Speed_Rads,
+            kth7823_Speed_Rads,
             (int)foc.mode,
             adc1_values_inj[0], adc1_values_inj[1],
             (unsigned long)adc_inj_miss_cnt);

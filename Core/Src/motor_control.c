@@ -1,6 +1,7 @@
 #include "motor_control.h"
 #include "drv8353.h"
 #include "kth7823.h"
+#include "kth7823_2.h"
 #include "sense.h"
 #include "foc.h"
 #include "protect.h"     // Protect_StopPWM（零偏标定失败时统一停三路输出）
@@ -96,11 +97,13 @@ void MotorControl_Init(void)
     //DRV8353F 初始化
     DRV8353_Init();
 
-    //KTH7823 初始化（电机轴编码器）
-    KTH7823_Init();
+    //kth7823 初始化（电机轴编码器）
+    kth7823_Init();
 
     //第二编码器初始化（减速器输出端，SPI3，芯片待定）
-    Encoder2_Init();
+    kth7823_2_Init();
+    // 输出端机械零点偏置：从 Flash 加载；未标定则保持 0（上电位置即零点，相对控制）
+    (void)kth7823_2_LoadZero();
 
     //FOC 算法初始化
     FOC_Init();
@@ -148,7 +151,8 @@ void FOC_TIM1_UpdateIRQHandler(void)
 
     // 编码器刷新（SPI 单帧流水线，20kHz）：放在最前面，使本拍 FOC 用到最新角度。
     // 注：单帧协议的返回值对应上一拍命令，固有滞后 1 个控制周期，由 _Comp 外推补偿。
-    KTH7823_Tick(control_tick);
+    kth7823_Tick(control_tick);       // 电机轴编码器（SPI1）
+    kth7823_2_Tick(control_tick);      // 输出轴编码器（SPI3），位置环角度源
 
     CurrentSense_Update();
 
@@ -156,7 +160,7 @@ void FOC_TIM1_UpdateIRQHandler(void)
     if (motor_ready) {
         FOC_Update();
         // LED 只是人眼指示，内部按 ms 计时，降频到 1kHz 不影响观感，省下每拍约 1.2µs
-        if ((control_tick % KTH7823_SLOW_DIV) == 0u) {
+        if ((control_tick % kth7823_SLOW_DIV) == 0u) {
             LED_Update();
         }
     }

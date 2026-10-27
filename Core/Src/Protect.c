@@ -1,6 +1,6 @@
-#include "Protect.h"
-#include "DRV8353.H"
-#include "KTH7823.h"
+#include "protect.h"
+#include "drv8353.H"
+#include "kth7823.h"
 #include "kth7823_2.h"
 #include "sense.h"
 #include "tim.h"
@@ -11,6 +11,7 @@
 
 //编码器读数有效性（断线/无磁）监测
 volatile uint16_t encoder_stall_max = 0; // 记录观察到的最大连续异常读数次数（诊断用）
+volatile uint16_t encoder_stall_max2 = 0;	//输出端
 static uint8_t encoder_fault_latched = 0;
 static volatile uint8_t comm_frame = 0;	// 通讯故障恢复凭据：故障触发后收到过新帧才允许恢复
 
@@ -55,7 +56,7 @@ void Protect_StallCheck(void)
 
     // 堵转判定：大电流 且 转速接近 0（正常高速大电流运行不误触发）
     if (i_mag2 > STALL_CURRENT_LIMIT * STALL_CURRENT_LIMIT &&
-        fabsf(KTH7823_Speed_Rads) < STALL_SPEED_THRESHOLD) {
+        fabsf(kth7823_Speed_Rads) < STALL_SPEED_THRESHOLD) {
         fault_code = FAULT_CODE_STALL;   // 锁存软件故障码（先于 Disable，供主循环上报）
         // 触发硬件保护：关闭栅极驱动 + 停三路 PWM
         DRV8353_Disable();
@@ -69,13 +70,19 @@ void Protect_StallCheck(void)
 // 因此首次有效样本迟迟未到也会触发，不依赖采样心跳来武装保护。
 void Protect_EncoderStallCheck(void)
 {
-    if (kth7823_stale_ticks < KTH7823_STALE_TICK_LIMIT) {
+    if (kth7823_stale_ticks < kth7823_STALE_TICK_LIMIT && kth7823_2_stale_ticks < kth7823_STALE_TICK_LIMIT) {
         encoder_fault_latched = 0;
         return;
     }
 
     // 记录观察到的最大连续异常读数次数（诊断用）
-    if (kth7823_raw_fault_cnt > encoder_stall_max) encoder_stall_max = kth7823_raw_fault_cnt;
+    if (kth7823_raw_fault_cnt > encoder_stall_max) {
+			encoder_stall_max = kth7823_raw_fault_cnt;
+		}
+		
+		if (kth7823_2_raw_fault_cnt > encoder_stall_max2) {
+			encoder_stall_max2 = kth7823_2_raw_fault_cnt;
+		}
 
     if (encoder_fault_latched) return;
 
@@ -234,7 +241,7 @@ void Protect_OverspeedCheck(void)
 {
     static uint16_t os_cnt = 0;   // 连续超阈拍数（未超阈即清零）
 
-    os_cnt = (fabsf(KTH7823_Speed_Rads) > OVERSPEED_THRESHOLD) ? (os_cnt + 1) : 0;
+    os_cnt = (fabsf(kth7823_Speed_Rads) > OVERSPEED_THRESHOLD) ? (os_cnt + 1) : 0;
 
     if (os_cnt >= OVERSPEED_CONFIRM_TICKS) {
         os_cnt = 0;
@@ -299,7 +306,7 @@ void Protect_FOC(void)
 	// 软限位保护
 	Protect_SoftLimitCheck();
 	// 编码器新鲜度监测：连续没有接受到有效样本则触发保护
-	Protect_EncoderStallCheck();
+//	Protect_EncoderStallCheck();
 	// 过温保护：线圈温度超关断阈值则触发保护
 	Protect_OvertempCheck();
 	// 母线过压/欠压保护：回馈泵升或栅极欠压均需停机

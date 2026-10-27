@@ -420,6 +420,36 @@
               <FilePath>..\Core\Src\kth7823_2.c</FilePath>
             </File>
             <File>
+              <FileName>drv8353.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\drv8353.c</FilePath>
+            </File>
+            <File>
+              <FileName>foc.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\foc.c</FilePath>
+            </File>
+            <File>
+              <FileName>kth7823.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\kth7823.c</FilePath>
+            </File>
+            <File>
+              <FileName>pid.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\pid.c</FilePath>
+            </File>
+            <File>
+              <FileName>protect.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\protect.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_control.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\motor_control.c</FilePath>
+            </File>
+            <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/main.c</FilePath>
@@ -473,36 +503,6 @@
               <FileName>stm32g4xx_hal_msp.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32g4xx_hal_msp.c</FilePath>
-            </File>
-            <File>
-              <FileName>drv8353.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\drv8353.c</FilePath>
-            </File>
-            <File>
-              <FileName>foc.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\foc.c</FilePath>
-            </File>
-            <File>
-              <FileName>kth7823.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\kth7823.c</FilePath>
-            </File>
-            <File>
-              <FileName>pid.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\pid.c</FilePath>
-            </File>
-            <File>
-              <FileName>protect.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\protect.c</FilePath>
-            </File>
-            <File>
-              <FileName>motor_control.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\motor_control.c</FilePath>
             </File>
           </Files>
         </Group>
@@ -642,6 +642,9 @@
           </Files>
         </Group>
         <Group>
+          <GroupName>::CMSIS</GroupName>
+        </Group>
+        <Group>
           <GroupName>Middlewares/Library/DSP Library/DSP Library</GroupName>
           <GroupOption>
             <CommonProperty>
@@ -738,9 +741,6 @@
               </FileOption>
             </File>
           </Files>
-        </Group>
-        <Group>
-          <GroupName>::CMSIS</GroupName>
         </Group>
       </Groups>
     </Target>

@@ -34,6 +34,8 @@
 
 // 编码器无有效新样本时的恢复重检间隔
 #define ENCODER_RECHECK_DELAY_MS  100u
+// 连续没有接受到有效角度样本的阈值：覆盖 SPI 失败、无效 raw 和解包裹野值
+#define kth7823_STALE_TICK_LIMIT  100u
 
 // 上位机通讯失联保护（CAN 心跳看门狗）
 // 上位机以 1kHz（每 1ms 一帧）周期性发送 CAN 帧，每收到一帧调用 Protect_CommFeed() 刷新心跳
@@ -55,7 +57,7 @@
 #define BUS_UNDERVOLTAGE_RECOVER    20.0f   // 欠压恢复阈值 (V)，滞回 2V
 #define BUS_VOLTAGE_RECHECK_DELAY   2000    // 母线电压恢复重检周期 (ms)
 
-// 超速保护阈值（KTH7823_Speed_Rads，电机轴机械角速度 rad/s）
+// 超速保护阈值（kth7823_Speed_Rads，电机轴机械角速度 rad/s）
 // 关节电机防飞车，正反转均检测。
 #define OVERSPEED_THRESHOLD   230.0f   // 超速停机阈值 (rad/s)，≈1.2×电机轴额定
 #define OVERSPEED_RECOVER     200.0f   // 恢复阈值 (rad/s)，≈1.05×额定，滞回 30

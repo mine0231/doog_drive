@@ -201,7 +201,8 @@ int main(void)
 		UART_Tx_Poll();
 		
 		// 编码器刷新，主循环做滤波角度（sin/cos + atan2，约 7µs，按 1kHz 跑）
-		KTH7823_SlowUpdate();
+		kth7823_SlowUpdate();
+		kth7823_2_SlowUpdate();   // 输出轴编码器单圈滤波角度
 		DWT_DelayMs(1);          // 定 1ms 节拍
 
 		// 喂独立看门狗：主循环 1ms 周期喂狗，远小于 1s 超时

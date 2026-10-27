@@ -5,13 +5,14 @@
 #include "dwt_delay.h"   // DWT_DelayMs
 #include "motor_control.h" 
 
+
 // 全局变量
-float KTH7823_Angle_Deg        = 0.0f;	// 当前角度（度）
-volatile float KTH7823_Angle_Rad = 0.0f;	// 单圈角度 [0, 2π)（慢路径，滤波后）
-volatile float KTH7823_Angle_Multiturn  = 0.0f;	// 多圈总角度（连续无界，弧度，未滤波）
-volatile float KTH7823_Angle_Multiturn_Comp = 0.0f;	// 一拍延迟补偿后的多圈角度（闭环角度源）
-volatile float KTH7823_Speed_RPM        = 0.0f;	// 当前速度（RPM）
-volatile float KTH7823_Speed_Rads = 0.0f;	// 当前速度（rad/s）
+float kth7823_Angle_Deg        = 0.0f;	// 当前角度（度）
+volatile float kth7823_Angle_Rad = 0.0f;	// 单圈角度 [0, 2π)（慢路径，滤波后）
+volatile float kth7823_Angle_Multiturn  = 0.0f;	// 多圈总角度（连续无界，弧度，未滤波）
+volatile float kth7823_Angle_Multiturn_Comp = 0.0f;	// 一拍延迟补偿后的多圈角度（闭环角度源）
+volatile float kth7823_Speed_RPM        = 0.0f;	// 当前速度（RPM）
+volatile float kth7823_Speed_Rads = 0.0f;	// 当前速度（rad/s）
 volatile uint32_t encoder_update_count = 0;	// 刷新心跳计数器：慢路径(1kHz)每拍 +1，供失速/断线监测判断编码器是否在刷新
 volatile uint16_t kth7823_raw_fault_cnt = 0;	// 连续异常读数（0x0000/0xFFFF）计数：正常 raw 清零，诊断用
 volatile uint16_t kth7823_stale_ticks = 0;	// 距离最近一次接受有效角度样本的控制周期数；通信/raw/解包裹异常均不刷新
@@ -36,7 +37,7 @@ static volatile uint8_t spi_in_frame = 0;	// 帧重入保护：SPI1 只允许一
 // 角度弧度转换
 static float raw_to_rad(uint16_t raw)
 {
-    return (float)raw / KTH7823_ANGLE_RESOLUTION * 2.0f * PI;  // 65536 个刻度覆盖 2π
+    return (float)raw / kth7823_ANGLE_RESOLUTION * 2.0f * PI;  // 65536 个刻度覆盖 2π
 }
 
 /* SPI 收发一帧 16bit（16 位数据帧，单字）
@@ -48,9 +49,9 @@ static float raw_to_rad(uint16_t raw)
  * 返回 1 = 成功；0 = 超时/重入被拒（调用方按"本拍无新角度"处理）。 */
 static uint8_t spi_exchange_frame(uint16_t tx, uint16_t *rx)
 {
-    SPI_TypeDef *spi = KTH7823_SPI->Instance;
+    SPI_TypeDef *spi = kth7823_SPI->Instance;
     uint32_t t0    = DWT->CYCCNT;
-    uint32_t limit = SystemCoreClock / (1000000u / KTH7823_SPI_TIMEOUT_US);  // µs → cycles
+    uint32_t limit = SystemCoreClock / (1000000u / kth7823_SPI_TIMEOUT_US);  // µs → cycles
     uint16_t rxw   = 0;
     uint8_t  ok    = 1;
 
@@ -129,8 +130,8 @@ static void kth_sample_fast(void)
         last_valid_cyc   = DWT->CYCCNT;
         raw_initialized  = 1;
         kth7823_stale_ticks = 0;
-        KTH7823_Angle_Multiturn      = angle_unwrapped;
-        KTH7823_Angle_Multiturn_Comp = angle_unwrapped;
+        kth7823_Angle_Multiturn      = angle_unwrapped;
+        kth7823_Angle_Multiturn_Comp = angle_unwrapped;
         return;
     }
 
@@ -138,13 +139,13 @@ static void kth_sample_fast(void)
     int16_t delta_raw = (int16_t)(raw - last_raw_angle);   // 自动处理跨 0xFFFF 边界
     // 野值剔除：单帧跳变超物理可能上限，判为坏读数/解包裹野值，丢弃本次——
     // 不更新 last_raw_angle、不累积角度，等下一次好读数再接续，避免多圈角阶跃与测速尖峰
-    if (delta_raw > KTH7823_UNWRAP_MAX_DELTA || delta_raw < -KTH7823_UNWRAP_MAX_DELTA) {
+    if (delta_raw > kth7823_UNWRAP_MAX_DELTA || delta_raw < -kth7823_UNWRAP_MAX_DELTA) {
         if (kth7823_unwrap_glitch_cnt < 0xFFFFu) kth7823_unwrap_glitch_cnt++;
         return;
     }
 
     last_raw_angle = raw;
-    angle_unwrapped += (float)delta_raw / KTH7823_ANGLE_RESOLUTION * 2.0f * PI;
+    angle_unwrapped += (float)delta_raw / kth7823_ANGLE_RESOLUTION * 2.0f * PI;
 
     // 一拍延迟补偿：用相邻两个"有效帧"的 DWT 间隔算角速度（不做低通）。
     // 1 count 量化 = 1.92 rad/s（50µs），折算到补偿量 <0.01° 电角度，可忽略。
@@ -155,15 +156,15 @@ static void kth_sample_fast(void)
         // 限幅：坏帧/抖动时避免补偿项飞掉（±400 rad/s 远高于 230 rad/s 超速阈值）
         if (omega >  400.0f) omega =  400.0f;
         if (omega < -400.0f) omega = -400.0f;
-        KTH7823_Angle_Multiturn_Comp = angle_unwrapped
-                                     + omega * (KTH7823_ANGLE_DELAY_PERIODS * control_dt);
+        kth7823_Angle_Multiturn_Comp = angle_unwrapped
+                                     + omega * (kth7823_ANGLE_DELAY_PERIODS * control_dt);
     } else {
-        KTH7823_Angle_Multiturn_Comp = angle_unwrapped;
+        kth7823_Angle_Multiturn_Comp = angle_unwrapped;
     }
     angle_prev_valid = angle_unwrapped;
     last_valid_cyc   = now;
 
-    KTH7823_Angle_Multiturn = angle_unwrapped;   // 未补偿值（上报/对齐/开环用）
+    kth7823_Angle_Multiturn = angle_unwrapped;   // 未补偿值（上报/对齐/开环用）
     kth7823_stale_ticks = 0;
 }
 
@@ -195,8 +196,8 @@ static void kth_update_filtered_angle(void)
     float filtered_angle = atan2f(filtered_sin, filtered_cos);
     if (filtered_angle < 0.0f) filtered_angle += 2.0f * PI;
 
-    KTH7823_Angle_Rad = filtered_angle;
-    KTH7823_Angle_Deg = filtered_angle * 180.0f / PI;
+    kth7823_Angle_Rad = filtered_angle;
+    kth7823_Angle_Deg = filtered_angle * 180.0f / PI;
 }
 
 /* 1kHz 慢路径：DWT 差分测速（窗口 ≈1ms，避免 20kHz 逐拍差分带来的量化噪声） */
@@ -207,8 +208,8 @@ static void kth_update_speed(void)
     if (last_speed_tick == 0) {   // 首帧建基准
         last_speed_tick = now;
         last_unwrapped_angle = angle_unwrapped;
-        KTH7823_Speed_Rads = 0.0f;
-        KTH7823_Speed_RPM  = 0.0f;
+        kth7823_Speed_Rads = 0.0f;
+        kth7823_Speed_RPM  = 0.0f;
         return;
     }
 
@@ -222,22 +223,22 @@ static void kth_update_speed(void)
     if (delta_angle < -PI) delta_angle += 2.0f * PI;
 
     float speed_raw = delta_angle / dt;
-    KTH7823_Speed_Rads += SPEED_FILTER_ALPHA * (speed_raw - KTH7823_Speed_Rads);
-    KTH7823_Speed_RPM = KTH7823_Speed_Rads * 60.0f / (2.0f * PI);
+    kth7823_Speed_Rads += SPEED_FILTER_ALPHA * (speed_raw - kth7823_Speed_Rads);
+    kth7823_Speed_RPM = kth7823_Speed_Rads * 60.0f / (2.0f * PI);
 
     last_unwrapped_angle = angle_unwrapped;
     last_speed_tick = now;
 }
 
-// KTH7823 初始化
-void KTH7823_Init(void)
+// kth7823 初始化
+void kth7823_Init(void)
 {
-    KTH7823_Angle_Rad = 0.0f;
-    KTH7823_Angle_Deg = 0.0f;
-    KTH7823_Angle_Multiturn = 0.0f;
-    KTH7823_Angle_Multiturn_Comp = 0.0f;
-    KTH7823_Speed_Rads = 0.0f;
-    KTH7823_Speed_RPM = 0.0f;
+    kth7823_Angle_Rad = 0.0f;
+    kth7823_Angle_Deg = 0.0f;
+    kth7823_Angle_Multiturn = 0.0f;
+    kth7823_Angle_Multiturn_Comp = 0.0f;
+    kth7823_Speed_Rads = 0.0f;
+    kth7823_Speed_RPM = 0.0f;
 
     filtered_cos = 1.0f;
     filtered_sin = 0.0f;
@@ -267,12 +268,12 @@ void KTH7823_Init(void)
  *   - 每拍：快路径 raw + 解包裹（闭环角度源）
  *   - 每 20 拍（1kHz）：测速 + 心跳计数（便宜，且阻塞命令期间也必须保持更新）
  * 滤波角度（cos/sin/atan2）不在这里做——实测约 7µs，会顶穿 20kHz 中断预算，
- * 放到主循环的 KTH7823_SlowUpdate() 里按 1kHz 跑。 */
-void KTH7823_Tick(uint32_t tick)
+ * 放到主循环的 kth7823_SlowUpdate() 里按 1kHz 跑。 */
+void kth7823_Tick(uint32_t tick)
 {
     kth_sample_fast();
 
-    if ((tick % KTH7823_SLOW_DIV) == 0u) {
+    if ((tick % kth7823_SLOW_DIV) == 0u) {
         kth_update_speed();
         encoder_update_count++;      // 心跳按 1kHz 递增，语义与改造前一致
     }
@@ -281,7 +282,7 @@ void KTH7823_Tick(uint32_t tick)
 /* 慢路径：滤波角度（sin/cos 低通 + atan2），由主循环按 ≈1kHz 调用。
  * 只读中断缓存的 raw（16 位原子），不碰 SPI，因此不会与中断抢总线。
  * α 语义与改造前一致（按 1kHz 调用定义），开环起始角/对齐平均/上报行为不变。 */
-void KTH7823_SlowUpdate(void)
+void kth7823_SlowUpdate(void)
 {
     kth_update_filtered_angle();
 }

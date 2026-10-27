@@ -570,12 +570,12 @@ void FDCAN_SendOLStatus(uint8_t evt)
     int16_t dev_deg100 = 0;   // 相对悬停点偏差 (0.01°，输出端)
     if (foc.openloop_move_state != FOC_OL_MOVE_IDLE) {
         // 输出端相对角：电机轴机械角差 / 减速比；×encoder_direction 保证"正=正转"
-        float rel_mech = (KTH7823_Angle_Multiturn - foc.openloop_move_ref_mech) * (float)encoder_direction;
+        float rel_mech = (kth7823_Angle_Multiturn - foc.openloop_move_ref_mech) * (float)encoder_direction;
         rel_deg10 = fd_sat_i16((rel_mech / gear) * FD_RAD2DEG * 10.0f);
 
         if (foc.openloop_move_state == FOC_OL_MOVE_HOLD ||
             foc.openloop_move_state == FOC_OL_MOVE_PULL) {
-            float dev_mech = (KTH7823_Angle_Multiturn - foc.openloop_move_hold_mech) * (float)encoder_direction;
+            float dev_mech = (kth7823_Angle_Multiturn - foc.openloop_move_hold_mech) * (float)encoder_direction;
             dev_deg100 = fd_sat_i16((dev_mech / gear) * FD_RAD2DEG * 100.0f);
         }
     }

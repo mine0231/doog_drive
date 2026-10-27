@@ -121,8 +121,8 @@ typedef struct {
     float target_Iq;      // 目标 Iq (A)
     float target_torque;      // 目标转矩 (Nm)，力矩级联使用
     float torque_constant;    // 电机转矩常数 Kt (Nm/A)，需按实测设置
-	float Vd_norm, Vq_norm;				 // 归一化电压指令
-	float openloop_angle;            // 开环模式下独立累加的电角度 (rad)
+		float Vd_norm, Vq_norm;				 // 归一化电压指令
+		float openloop_angle;            // 开环模式下独立累加的电角度 (rad)
     float openloop_voltage;          // 开环模式下手动给定的电压幅值 (V)
     uint8_t openloop_hold;           // 1 = 开环保持（电弹簧）：冻结 openloop_angle，改用 Vd 通电保持力矩，
                                      //     与 ALIGN 磁力定位同形态；0 = 正常开环（角度按 target_speed_ramp 积分）
@@ -134,7 +134,7 @@ typedef struct {
     float   openloop_move_remain;     // RUN 阶段剩余电角度 (rad，非负)，递减到 0 判到位；其余状态为 0
     float   openloop_move_ref_mech;   // 本次动作起点：电机轴多圈机械角 (rad)，供 CAN 层换算输出端相对角
     float   openloop_move_hold_mech;  // 到位悬停点：电机轴多圈机械角 (rad)，供 CAN 层换算悬停偏差
-    // 位置环字段（减速器输出端位置，单位 rad，Encoder2_Angle_Multiturn 范围）
+    // 位置环字段（减速器输出端位置，单位 rad，kth7823_2_Angle_Multiturn 范围）
     float target_position;       // 目标输出端位置 (rad)
     float position_error;        // 实时位置误差 = target_position - current_position（仅诊断/保护读）
     float pos_err_integral_acc;  // 位置误差持续超限的周期累计（保护用）

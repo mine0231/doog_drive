@@ -272,9 +272,7 @@ void TIM1_UP_TIM16_IRQHandler(void)
 		FOC_TIM1_UpdateIRQHandler();
   }
   /* USER CODE END TIM1_UP_TIM16_IRQn 0 */
-  // TIM1 只使能了 UPDATE 中断，且 UIF 已在上面由直连函数清除，HAL 分发没有可处理的事件。
-  // 保留调用每拍要多花约 2.4µs（实测 entry+HAL≈2.8µs），故关闭。
-  // HAL_TIM_IRQHandler(&htim1);
+  HAL_TIM_IRQHandler(&htim1);
   /* USER CODE BEGIN TIM1_UP_TIM16_IRQn 1 */
 
   /* USER CODE END TIM1_UP_TIM16_IRQn 1 */

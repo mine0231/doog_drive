@@ -1,4 +1,4 @@
-drive/kth7823_2.o: ..\Core\Src\kth7823_2.c ..\Core\Inc\KTH7823_2.h \
+drive/kth7823_2.o: ..\Core\Src\kth7823_2.c ..\Core\Inc\kth7823_2.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal.h \
   ..\Core\Inc\stm32g4xx_hal_conf.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_rcc.h \
@@ -31,6 +31,8 @@ drive/kth7823_2.o: ..\Core\Src\kth7823_2.c ..\Core\Inc\KTH7823_2.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_tim_ex.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_uart.h \
   ..\Drivers\STM32G4xx_HAL_Driver\Inc\stm32g4xx_hal_uart_ex.h \
-  ..\Middlewares\ST\ARM\DSP\Inc\arm_math.h \
+  ..\Core\Inc\main.h ..\Middlewares\ST\ARM\DSP\Inc\arm_math.h \
   ..\Drivers\CMSIS\Include\cmsis_compiler.h ..\Core\Inc\spi.h \
-  ..\Core\Inc\main.h ..\Core\Inc\dwt_delay.h
+  ..\Core\Inc\dwt_delay.h ..\Core\Inc\motor_control.h \
+  ..\Core\Inc\kth7823.h ..\Core\Inc\foc.h ..\Core\Inc\pid.h \
+  ..\Core\Inc\drv8353.h ..\Core\Inc\sense.h
