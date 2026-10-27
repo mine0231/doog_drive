@@ -705,31 +705,38 @@ void FOC_Update(void)
 			// Park变换（得到 Id, Iq）
 			FOC_Park();
 
-			// ===== 级联流水线：位置环(外) → 速度环(中) → 电流环(内)，三层数据单向流动 =====
-			float speed_ref;
+			// ===== 双速率级联：位置环(外)/速度环(中) 10kHz，电流环(内) 20kHz =====
+			// 电流环每拍运行；外环每 OUTER_LOOP_DIV 拍运行一次（20kHz/2 = 10kHz），
+			// 跳过的拍对 foc.target_Iq 零阶保持，电流环继续跟踪保持值。
+			const uint8_t outer_run = ((control_tick % OUTER_LOOP_DIV) == 0u);
+			float speed_ref = foc.target_speed_ramp;   // 速度/力矩模式的默认给定（已斜坡）
 
-			// 第 1 层：位置环（最外层）。仅位置模式启用（POSITION 深度最高）
-			if (foc.mode >= FOC_STATE_POSITION) {
-				float output_pos = kth7823_2_OutputPos(kth7823_2_Angle_Multiturn);
-				foc.position_error = foc.target_position - output_pos;
-				speed_ref = PID_Calculate(&pid_position,
-				                          foc.target_position,
-				                          output_pos,
-				                          control_dt);
-			} else {
-				// 速度/力矩模式：速度环目标直接来自外部给定（已斜坡）
-				speed_ref = foc.target_speed_ramp;
+			if (outer_run) {
+				// 外环周期 = OUTER_LOOP_DIV × control_dt（100µs），保证积分/微分速率不变
+				const float outer_dt = control_dt * (float)OUTER_LOOP_DIV;
+
+				// 第 1 层：位置环（最外层）。仅位置模式启用（POSITION 深度最高）
+				if (foc.mode >= FOC_STATE_POSITION) {
+					float output_pos = kth7823_2_OutputPos(kth7823_2_Angle_Multiturn);
+					foc.position_error = foc.target_position - output_pos;
+					speed_ref = PID_Calculate(&pid_position,
+					                          foc.target_position,
+					                          output_pos,
+					                          outer_dt);
+				}
+
+				// 第 2 层：速度环（中层）。速度/位置启用(>= SPEED)；力矩模式旁路
+				if (foc.mode >= FOC_STATE_SPEED) {
+					foc.target_Iq = PID_Calculate(&pid_speed, speed_ref, foc.speed, outer_dt);
+				}
 			}
 
-			// 第 2 层：速度环（中层）。速度/位置启用(>= SPEED)；力矩模式直接给定 Iq 旁路速度环
-			if (foc.mode >= FOC_STATE_SPEED) {
-				foc.target_Iq = PID_Calculate(&pid_speed, speed_ref, foc.speed, control_dt);
-			} else {
-				// 力矩模式：目标 Iq 由力矩直接换算（T = Kt × Iq）
+			// 力矩模式无外环：目标 Iq 由力矩每拍换算（T = Kt × Iq），保持 20kHz 跟踪
+			if (foc.mode == FOC_STATE_TORQUE) {
 				foc.target_Iq = foc.target_torque / foc.torque_constant;
 			}
 
-			// 第 3 层：电流环（最内层，始终运行，所有模式共用）
+			// 第 3 层：电流环（最内层，始终每拍运行，20kHz）
 			foc.Vq = PID_Calculate(&pid_iq, foc.target_Iq, foc.Iq, control_dt);
 			foc.Vd = PID_Calculate(&pid_id, 0.0f, foc.Id, control_dt);  // Id 目标 = 0
 			break;
@@ -892,6 +899,11 @@ void FOC_SetMode(FOC_State_t mode)
 	}
 
 	// 进入闭环各模式时的平滑初始化
+	if (mode == FOC_STATE_SPEED || mode == FOC_STATE_POSITION) {
+		// 双速率外环：切入瞬间的下一拍不一定落在外环分频拍上，
+		// 先清零目标 Iq，避免分频首拍沿用上一模式的残留值造成电流冲击
+		foc.target_Iq = 0.0f;
+	}
 	if (mode == FOC_STATE_POSITION) {
 		// 进入位置级联：位置目标 = 当前绝对位置（防阶跃冲击），重置位置误差累积
 		foc.target_position = kth7823_2_OutputPos(kth7823_2_Angle_Multiturn);

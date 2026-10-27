@@ -18,6 +18,12 @@
 #define FOC_CLOSEDLOOP_ENABLE 0		// 0 = 禁用闭环（硬件验证阶段使用）  1 = 启用闭环（功能调试阶段打开）
 #define MOTOR_POLE_PAIRS  21  	// 电机极对数
 
+/* 双速率控制：电流环 20kHz（TIM1 更新中断每拍），位置环/速度环降为 10kHz。
+ * 外环每 OUTER_LOOP_DIV 个电流环周期执行一次（跳过的拍对 target_Iq 零阶保持），
+ * 外环 PID 必须传 control_dt * OUTER_LOOP_DIV 作为计算周期，Kp/Ki/Kd 语义才不变。
+ * 2 = 外环 10kHz；改 4 即外环 5kHz。无需改 TIM1/ADC/PWM 配置。 */
+#define OUTER_LOOP_DIV  2u
+
 // 故障退避冷却时间（FOC_STATE_FAULT 状态机使用，指数退避：1次→2s,2次→4s...封顶）
 #define FAULT_RETRY_DELAY     2000    // 基础冷却时间(ms)，每次重试按 2^(n-1) 增长
 #define FAULT_RETRY_DELAY_MAX 16000   // 退避冷却时间上限(ms)，防止等待过久
